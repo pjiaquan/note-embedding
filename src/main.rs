@@ -1,5 +1,6 @@
 mod config;
 mod service;
+mod telegram;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -14,17 +15,18 @@ use service::{ServiceAction, handle_service_action};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use telegram::{
+    answer_callback_query, log_telegram_callback_usage, log_telegram_message_usage,
+    notify_user_access_approved, register_bot_commands, send_access_request_to_admins,
+    send_document_content_to_chat, send_document_to_chat, send_text_to_chat,
+    send_text_to_chat_with_command_keyboard, send_text_to_chat_with_document_button,
+    send_to_telegram, send_to_telegram_with_document_button,
+};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
 use walkdir::WalkDir;
-
-const TELEGRAM_AUDIT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
-const TELEGRAM_TEXT_MESSAGE_MAX_CHARS: usize = 3800;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -141,153 +143,6 @@ fn upsert_pdf_tracking_record(db: &Connection, path: &Path, status: &str) -> Res
     Ok(())
 }
 
-// --- Telegram 发送函数 ---
-fn send_to_telegram(config: &TelegramConfig, message: &str) -> Result<()> {
-    if !config.enabled || config.chat_id == 0 {
-        return Ok(());
-    }
-
-    send_text_to_chat(&config.bot_token, config.chat_id, message, None)
-}
-
-fn send_text_to_chat(
-    bot_token: &str,
-    chat_id: i64,
-    message: &str,
-    reply_to_message_id: Option<i32>,
-) -> Result<()> {
-    send_text_to_chat_with_parse_mode(bot_token, chat_id, message, reply_to_message_id, None)
-}
-
-fn send_text_to_chat_with_parse_mode(
-    bot_token: &str,
-    chat_id: i64,
-    message: &str,
-    reply_to_message_id: Option<i32>,
-    parse_mode: Option<frankenstein::ParseMode>,
-) -> Result<()> {
-    use frankenstein::TelegramApi;
-    let api = frankenstein::Api::new(bot_token);
-    let send_message_params = match (reply_to_message_id, parse_mode) {
-        (Some(reply_to_message_id), Some(parse_mode)) => frankenstein::SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(message)
-            .parse_mode(parse_mode)
-            .reply_to_message_id(reply_to_message_id)
-            .build(),
-        (Some(reply_to_message_id), None) => frankenstein::SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(message)
-            .reply_to_message_id(reply_to_message_id)
-            .build(),
-        (None, Some(parse_mode)) => frankenstein::SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(message)
-            .parse_mode(parse_mode)
-            .build(),
-        (None, None) => frankenstein::SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(message)
-            .build(),
-    };
-    api.send_message(&send_message_params)?;
-    Ok(())
-}
-
-fn send_large_text_to_chat(
-    bot_token: &str,
-    chat_id: i64,
-    message: &str,
-    reply_to_message_id: Option<i32>,
-    parse_mode: Option<frankenstein::ParseMode>,
-) -> Result<()> {
-    if message.is_empty() {
-        return Ok(());
-    }
-
-    let mut start = 0;
-    let chars: Vec<char> = message.chars().collect();
-    while start < chars.len() {
-        let end = usize::min(start + TELEGRAM_TEXT_MESSAGE_MAX_CHARS, chars.len());
-        let chunk: String = chars[start..end].iter().collect();
-        if let Some(mode) = parse_mode.clone() {
-            if send_text_to_chat_with_parse_mode(
-                bot_token,
-                chat_id,
-                &chunk,
-                reply_to_message_id,
-                Some(mode),
-            )
-            .is_ok()
-            {
-                start = end;
-                continue;
-            }
-        }
-        send_text_to_chat(bot_token, chat_id, &chunk, reply_to_message_id)?;
-        start = end;
-    }
-
-    Ok(())
-}
-
-fn send_document_content_to_chat(
-    bot_token: &str,
-    chat_id: i64,
-    path: &Path,
-    reply_to_message_id: Option<i32>,
-) -> Result<()> {
-    if is_pdf_path(path) {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read document content from {}", path.display()))?;
-    if content.trim().is_empty() {
-        return send_text_to_chat(
-            bot_token,
-            chat_id,
-            "Document content is empty.",
-            reply_to_message_id,
-        );
-    }
-
-    let message = format!("Content:\n\n{content}");
-    #[allow(deprecated)]
-    let parse_mode = if looks_like_markdown(path, &content) {
-        Some(frankenstein::ParseMode::Markdown)
-    } else {
-        None
-    };
-    send_large_text_to_chat(bot_token, chat_id, &message, reply_to_message_id, parse_mode)
-}
-
-fn looks_like_markdown(path: &Path, content: &str) -> bool {
-    if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-    {
-        return true;
-    }
-
-    content.lines().take(20).any(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with('#')
-            || trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("> ")
-            || trimmed.starts_with("```")
-            || looks_like_ordered_list(trimmed)
-            || (trimmed.contains('[') && trimmed.contains("]("))
-    })
-}
-
-fn looks_like_ordered_list(line: &str) -> bool {
-    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    digits > 0 && line[digits..].starts_with(". ")
-}
-
 fn send_text_to_chat_with_search_results(
     bot_token: &str,
     chat_id: i64,
@@ -319,209 +174,6 @@ fn send_text_to_chat_with_search_results(
     Ok(())
 }
 
-fn send_text_to_chat_with_document_button(
-    bot_token: &str,
-    chat_id: i64,
-    message: &str,
-    doc_match: &QueryMatch,
-    reply_to_message_id: Option<i32>,
-) -> Result<()> {
-    use frankenstein::{
-        InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, SendMessageParams, TelegramApi,
-    };
-
-    let api = frankenstein::Api::new(bot_token);
-    let keyboard = InlineKeyboardMarkup::builder()
-        .inline_keyboard(vec![vec![
-            InlineKeyboardButton::builder()
-                .text(format_button_label(&doc_match.header))
-                .callback_data(format!("doc:{}", doc_match.id))
-                .build(),
-        ]])
-        .build();
-
-    let send_message_params = match reply_to_message_id {
-        Some(reply_to_message_id) => SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(message)
-            .reply_to_message_id(reply_to_message_id)
-            .reply_markup(ReplyMarkup::InlineKeyboardMarkup(keyboard))
-            .build(),
-        None => SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(message)
-            .reply_markup(ReplyMarkup::InlineKeyboardMarkup(keyboard))
-            .build(),
-    };
-    api.send_message(&send_message_params)?;
-    Ok(())
-}
-
-fn unix_timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn truncate_audit_value(value: &str, limit: usize) -> String {
-    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = cleaned.chars();
-    let truncated: String = chars.by_ref().take(limit).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
-
-fn append_telegram_audit_log(config: &AppConfig, line: &str) -> Result<()> {
-    if let Some(parent) = config.telegram.audit_log_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create audit log directory {}", parent.display())
-            })?;
-        }
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config.telegram.audit_log_path)
-        .with_context(|| {
-            format!(
-                "failed to open Telegram audit log {}",
-                config.telegram.audit_log_path.display()
-            )
-        })?;
-    writeln!(file, "{line}")?;
-    trim_telegram_audit_log(&config.telegram.audit_log_path, TELEGRAM_AUDIT_LOG_MAX_BYTES)?;
-    Ok(())
-}
-
-fn trim_telegram_audit_log(path: &Path, max_bytes: u64) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("failed to read audit log metadata {}", path.display()))?;
-    if metadata.len() <= max_bytes {
-        return Ok(());
-    }
-
-    let content = fs::read(path)
-        .with_context(|| format!("failed to read audit log for trimming {}", path.display()))?;
-    let keep_from = content.len().saturating_sub(max_bytes as usize);
-    let trimmed = &content[keep_from..];
-    let start = trimmed
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    fs::write(path, &trimmed[start..])
-        .with_context(|| format!("failed to rewrite trimmed audit log {}", path.display()))?;
-    Ok(())
-}
-
-fn log_telegram_usage(config: &AppConfig, line: String) {
-    println!("{} {}", ui::info_label(), line);
-    if let Err(err) = append_telegram_audit_log(config, &line) {
-        eprintln!(
-            "Failed to write Telegram audit log at {}: {err}",
-            config.telegram.audit_log_path.display()
-        );
-    }
-}
-
-fn log_telegram_message_usage(
-    config: &AppConfig,
-    message: &frankenstein::Message,
-    allowed: bool,
-    action: &str,
-    detail: &str,
-) {
-    let username = message
-        .from
-        .as_ref()
-        .and_then(|user| user.username.as_deref())
-        .unwrap_or("-");
-    let user_id = message.from.as_ref().map(|user| user.id).unwrap_or_default();
-    let line = format!(
-        "telegram usage ts={} type=message allowed={} chat_id={} user_id={} username={} action={} detail={}",
-        unix_timestamp_secs(),
-        allowed,
-        message.chat.id,
-        user_id,
-        username,
-        action,
-        truncate_audit_value(detail, 120)
-    );
-    log_telegram_usage(config, line);
-}
-
-fn log_telegram_callback_usage(
-    config: &AppConfig,
-    callback_query: &frankenstein::CallbackQuery,
-    allowed: bool,
-    action: &str,
-    detail: &str,
-) {
-    let username = callback_query.from.username.as_deref().unwrap_or("-");
-    let chat_id = callback_query
-        .message
-        .as_ref()
-        .map(|message| message.chat.id.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let line = format!(
-        "telegram usage ts={} type=callback allowed={} chat_id={} user_id={} username={} action={} detail={}",
-        unix_timestamp_secs(),
-        allowed,
-        chat_id,
-        callback_query.from.id,
-        username,
-        action,
-        truncate_audit_value(detail, 120)
-    );
-    log_telegram_usage(config, line);
-}
-
-fn send_access_request_to_admins(
-    bot_token: &str,
-    admin_user_ids: &[u64],
-    requester_user_id: u64,
-) -> Result<usize> {
-    use frankenstein::{
-        InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, SendMessageParams, TelegramApi,
-    };
-
-    let api = frankenstein::Api::new(bot_token);
-    let keyboard = InlineKeyboardMarkup::builder()
-        .inline_keyboard(vec![vec![
-            InlineKeyboardButton::builder()
-                .text(format!("Approve {requester_user_id}"))
-                .callback_data(format!("approve:{requester_user_id}"))
-                .build(),
-        ]])
-        .build();
-    let text = format!(
-        "Access request received.\nUser ID: {requester_user_id}\nApprove with /approve {requester_user_id} or the button below."
-    );
-
-    let mut delivered = 0;
-    for admin_user_id in admin_user_ids {
-        let Ok(chat_id) = i64::try_from(*admin_user_id) else {
-            continue;
-        };
-        let params = SendMessageParams::builder()
-            .chat_id(chat_id)
-            .text(&text)
-            .reply_markup(ReplyMarkup::InlineKeyboardMarkup(keyboard.clone()))
-            .build();
-        if api.send_message(&params).is_ok() {
-            delivered += 1;
-        }
-    }
-
-    Ok(delivered)
-}
-
 fn edit_search_results_message(
     bot_token: &str,
     chat_id: i64,
@@ -540,52 +192,6 @@ fn edit_search_results_message(
         .reply_markup(build_search_results_keyboard(session_id, session, page))
         .build();
     api.edit_message_text(&params)?;
-    Ok(())
-}
-
-fn send_document_to_chat(
-    bot_token: &str,
-    chat_id: i64,
-    document_path: &Path,
-    caption: &str,
-    reply_to_message_id: Option<i32>,
-) -> Result<()> {
-    use frankenstein::TelegramApi;
-    let api = frankenstein::Api::new(bot_token);
-    let send_document_params = match reply_to_message_id {
-        Some(reply_to_message_id) => frankenstein::SendDocumentParams::builder()
-            .chat_id(chat_id)
-            .document(document_path.to_path_buf())
-            .caption(caption.to_string())
-            .reply_to_message_id(reply_to_message_id)
-            .build(),
-        None => frankenstein::SendDocumentParams::builder()
-            .chat_id(chat_id)
-            .document(document_path.to_path_buf())
-            .caption(caption.to_string())
-            .build(),
-    };
-    api.send_document(&send_document_params)?;
-    Ok(())
-}
-
-fn answer_callback_query(
-    bot_token: &str,
-    callback_query_id: &str,
-    text: Option<&str>,
-) -> Result<()> {
-    use frankenstein::{AnswerCallbackQueryParams, TelegramApi};
-    let api = frankenstein::Api::new(bot_token);
-    let params = match text {
-        Some(text) => AnswerCallbackQueryParams::builder()
-            .callback_query_id(callback_query_id)
-            .text(text)
-            .build(),
-        None => AnswerCallbackQueryParams::builder()
-            .callback_query_id(callback_query_id)
-            .build(),
-    };
-    api.answer_callback_query(&params)?;
     Ok(())
 }
 
@@ -627,18 +233,6 @@ fn grant_telegram_user_access(
     config.telegram.allowed_user_ids.dedup();
     write_telegram_allowed_user_ids(config_path, &config.telegram.allowed_user_ids)?;
     Ok(true)
-}
-
-fn notify_user_access_approved(bot_token: &str, user_id: u64) -> Result<()> {
-    let Ok(chat_id) = i64::try_from(user_id) else {
-        return Ok(());
-    };
-    send_text_to_chat(
-        bot_token,
-        chat_id,
-        "Your access request was approved. You can use the bot now.",
-        None,
-    )
 }
 
 #[derive(Debug, Clone)]
@@ -1096,15 +690,17 @@ fn handle_telegram_query_message(
                     delivered, from_user.id
                 )
             };
-            send_text_to_chat(
+            send_text_to_chat_with_command_keyboard(
                 &config.telegram.bot_token,
                 chat_id,
                 &response,
                 reply_to_message_id,
+                false,
+                false,
             )?;
             return Ok(());
         }
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             &format!(
@@ -1112,6 +708,8 @@ fn handle_telegram_query_message(
                 from_user.id
             ),
             reply_to_message_id,
+            false,
+            false,
         )?;
         return Ok(());
     }
@@ -1119,22 +717,26 @@ fn handle_telegram_query_message(
     log_telegram_message_usage(config, message, true, action, detail);
 
     if is_join_command(text) {
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             "You already have access.",
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         return Ok(());
     }
 
     if let Some(requested_user_id) = parse_approve_command(text) {
         if !is_admin {
-            send_text_to_chat(
+            send_text_to_chat_with_command_keyboard(
                 &config.telegram.bot_token,
                 chat_id,
                 "Admin only command.",
                 reply_to_message_id,
+                true,
+                is_admin,
             )?;
             return Ok(());
         }
@@ -1144,11 +746,13 @@ fn handle_telegram_query_message(
         } else {
             format!("Telegram user ID {requested_user_id} already has access.")
         };
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             &response,
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         if added {
             notify_user_access_approved(&config.telegram.bot_token, requested_user_id)?;
@@ -1156,22 +760,26 @@ fn handle_telegram_query_message(
         return Ok(());
     }
     if is_approve_command(text) {
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             "Usage: /approve <telegram_user_id>",
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         return Ok(());
     }
 
     if is_new_command(text) {
         state.awaiting_new_chats.insert(chat_id);
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             "Ready to receive new content. Send plain text or upload a .txt/.md file in your next message.",
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         return Ok(());
     }
@@ -1190,7 +798,8 @@ fn handle_telegram_query_message(
                 &config.telegram.bot_token,
                 chat_id,
                 "Saved new document.",
-                &stored_doc,
+                &stored_doc.header,
+                stored_doc.id,
                 reply_to_message_id,
             )?;
             return Ok(());
@@ -1204,7 +813,8 @@ fn handle_telegram_query_message(
                 &config.telegram.bot_token,
                 chat_id,
                 "Saved new text.",
-                &stored_doc,
+                &stored_doc.header,
+                stored_doc.id,
                 reply_to_message_id,
             )?;
             return Ok(());
@@ -1213,11 +823,13 @@ fn handle_telegram_query_message(
 
     if text.is_empty() {
         if state.awaiting_new_chats.contains(&chat_id) {
-            send_text_to_chat(
+            send_text_to_chat_with_command_keyboard(
                 &config.telegram.bot_token,
                 chat_id,
                 "Send plain text or upload a .txt/.md file.",
                 reply_to_message_id,
+                true,
+                is_admin,
             )?;
         }
         return Ok(());
@@ -1226,11 +838,13 @@ fn handle_telegram_query_message(
     if is_recent_documents_command(text) {
         let latest_docs = find_latest_documents(db, 10)?;
         if latest_docs.is_empty() {
-            send_text_to_chat(
+            send_text_to_chat_with_command_keyboard(
                 &config.telegram.bot_token,
                 chat_id,
                 "No documents are stored yet.",
                 reply_to_message_id,
+                true,
+                is_admin,
             )?;
             return Ok(());
         }
@@ -1259,31 +873,37 @@ fn handle_telegram_query_message(
             cleanup.duplicate_embeddings_removed,
             cleanup.total_removed()
         );
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             &response,
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         return Ok(());
     }
     let Some(query) = parse_search_command(text) else {
         let help = telegram_help_message(text, is_admin);
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             &help,
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         return Ok(());
     };
 
     if query.is_empty() {
-        send_text_to_chat(
+        send_text_to_chat_with_command_keyboard(
             &config.telegram.bot_token,
             chat_id,
             "Usage: /s <keywords>",
             reply_to_message_id,
+            true,
+            is_admin,
         )?;
         return Ok(());
     }
@@ -1296,11 +916,13 @@ fn handle_telegram_query_message(
 
     match threshold_matches.as_slice() {
         [] => {
-            send_text_to_chat(
+            send_text_to_chat_with_command_keyboard(
                 &config.telegram.bot_token,
                 chat_id,
                 "No documents matched that query above the configured threshold. Try more specific keywords or lower telegram.match_accuracy.",
                 reply_to_message_id,
+                true,
+                is_admin,
             )?;
         }
         many => {
@@ -2731,8 +2353,22 @@ fn process_new_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Res
         embedding.vector.len(),
         summary
     );
-    if let Err(err) = send_to_telegram(&config.telegram, &message) {
-        eprintln!("TG 发送失败: {err}");
+    match find_document_by_path(db, &processed_path)? {
+        Some(stored_doc) => {
+            if let Err(err) = send_to_telegram_with_document_button(
+                &config.telegram,
+                &message,
+                &stored_doc.header,
+                stored_doc.id,
+            ) {
+                eprintln!("TG 发送失败: {err}");
+            }
+        }
+        None => {
+            if let Err(err) = send_to_telegram(&config.telegram, &message) {
+                eprintln!("TG 发送失败: {err}");
+            }
+        }
     }
 
     Ok(())
@@ -2852,6 +2488,9 @@ async fn main() -> Result<()> {
         ui::path(config.processed_dir.display())
     );
     if config.telegram.enabled {
+        if let Err(err) = register_bot_commands(&config.telegram) {
+            eprintln!("Failed to register Telegram bot commands: {err}");
+        }
         println!(
             "Telegram polling: every {} second(s), match accuracy {}",
             ui::value(config.telegram.poll_interval_secs),
