@@ -24,6 +24,7 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 use walkdir::WalkDir;
 
 const TELEGRAM_AUDIT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const TELEGRAM_TEXT_MESSAGE_MAX_CHARS: usize = 3800;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -155,21 +156,136 @@ fn send_text_to_chat(
     message: &str,
     reply_to_message_id: Option<i32>,
 ) -> Result<()> {
+    send_text_to_chat_with_parse_mode(bot_token, chat_id, message, reply_to_message_id, None)
+}
+
+fn send_text_to_chat_with_parse_mode(
+    bot_token: &str,
+    chat_id: i64,
+    message: &str,
+    reply_to_message_id: Option<i32>,
+    parse_mode: Option<frankenstein::ParseMode>,
+) -> Result<()> {
     use frankenstein::TelegramApi;
     let api = frankenstein::Api::new(bot_token);
-    let send_message_params = match reply_to_message_id {
-        Some(reply_to_message_id) => frankenstein::SendMessageParams::builder()
+    let send_message_params = match (reply_to_message_id, parse_mode) {
+        (Some(reply_to_message_id), Some(parse_mode)) => frankenstein::SendMessageParams::builder()
+            .chat_id(chat_id)
+            .text(message)
+            .parse_mode(parse_mode)
+            .reply_to_message_id(reply_to_message_id)
+            .build(),
+        (Some(reply_to_message_id), None) => frankenstein::SendMessageParams::builder()
             .chat_id(chat_id)
             .text(message)
             .reply_to_message_id(reply_to_message_id)
             .build(),
-        None => frankenstein::SendMessageParams::builder()
+        (None, Some(parse_mode)) => frankenstein::SendMessageParams::builder()
+            .chat_id(chat_id)
+            .text(message)
+            .parse_mode(parse_mode)
+            .build(),
+        (None, None) => frankenstein::SendMessageParams::builder()
             .chat_id(chat_id)
             .text(message)
             .build(),
     };
     api.send_message(&send_message_params)?;
     Ok(())
+}
+
+fn send_large_text_to_chat(
+    bot_token: &str,
+    chat_id: i64,
+    message: &str,
+    reply_to_message_id: Option<i32>,
+    parse_mode: Option<frankenstein::ParseMode>,
+) -> Result<()> {
+    if message.is_empty() {
+        return Ok(());
+    }
+
+    let mut start = 0;
+    let chars: Vec<char> = message.chars().collect();
+    while start < chars.len() {
+        let end = usize::min(start + TELEGRAM_TEXT_MESSAGE_MAX_CHARS, chars.len());
+        let chunk: String = chars[start..end].iter().collect();
+        if let Some(mode) = parse_mode.clone() {
+            if send_text_to_chat_with_parse_mode(
+                bot_token,
+                chat_id,
+                &chunk,
+                reply_to_message_id,
+                Some(mode),
+            )
+            .is_ok()
+            {
+                start = end;
+                continue;
+            }
+        }
+        send_text_to_chat(bot_token, chat_id, &chunk, reply_to_message_id)?;
+        start = end;
+    }
+
+    Ok(())
+}
+
+fn send_document_content_to_chat(
+    bot_token: &str,
+    chat_id: i64,
+    path: &Path,
+    reply_to_message_id: Option<i32>,
+) -> Result<()> {
+    if is_pdf_path(path) {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read document content from {}", path.display()))?;
+    if content.trim().is_empty() {
+        return send_text_to_chat(
+            bot_token,
+            chat_id,
+            "Document content is empty.",
+            reply_to_message_id,
+        );
+    }
+
+    let message = format!("Content:\n\n{content}");
+    #[allow(deprecated)]
+    let parse_mode = if looks_like_markdown(path, &content) {
+        Some(frankenstein::ParseMode::Markdown)
+    } else {
+        None
+    };
+    send_large_text_to_chat(bot_token, chat_id, &message, reply_to_message_id, parse_mode)
+}
+
+fn looks_like_markdown(path: &Path, content: &str) -> bool {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        return true;
+    }
+
+    content.lines().take(20).any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('#')
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("> ")
+            || trimmed.starts_with("```")
+            || looks_like_ordered_list(trimmed)
+            || (trimmed.contains('[') && trimmed.contains("]("))
+    })
+}
+
+fn looks_like_ordered_list(line: &str) -> bool {
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digits > 0 && line[digits..].starts_with(". ")
 }
 
 fn send_text_to_chat_with_search_results(
@@ -1528,6 +1644,12 @@ fn handle_telegram_callback_query(
         message.chat.id,
         &doc_match.path,
         &caption,
+        Some(message.message_id),
+    )?;
+    send_document_content_to_chat(
+        &config.telegram.bot_token,
+        message.chat.id,
+        &doc_match.path,
         Some(message.message_id),
     )?;
 
