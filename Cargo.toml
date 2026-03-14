@@ -1,0 +1,28 @@
+[package]
+name = "note-embedding"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 文件监控
+notify = "6.1.1"
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+# 数据库
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+# Telegram Bot
+frankenstein = "0.18.0"
+# 推理框架 (用于加载 Embedding-Gemma)
+candle-core = "0.8.0"
+candle-transformers = "0.8.0"
+candle-nn = "0.8.0"
+tokenizers = "0.21.0"
+# 其他工具
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+directories = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+ureq = "2.12"
+walkdir = "2.5"
