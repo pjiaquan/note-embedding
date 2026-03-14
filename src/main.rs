@@ -14,11 +14,16 @@ use service::{ServiceAction, handle_service_action};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
 use walkdir::WalkDir;
+
+const TELEGRAM_AUDIT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -236,6 +241,171 @@ fn send_text_to_chat_with_document_button(
     Ok(())
 }
 
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn truncate_audit_value(value: &str, limit: usize) -> String {
+    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = cleaned.chars();
+    let truncated: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn append_telegram_audit_log(config: &AppConfig, line: &str) -> Result<()> {
+    if let Some(parent) = config.telegram.audit_log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create audit log directory {}", parent.display())
+            })?;
+        }
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.telegram.audit_log_path)
+        .with_context(|| {
+            format!(
+                "failed to open Telegram audit log {}",
+                config.telegram.audit_log_path.display()
+            )
+        })?;
+    writeln!(file, "{line}")?;
+    trim_telegram_audit_log(&config.telegram.audit_log_path, TELEGRAM_AUDIT_LOG_MAX_BYTES)?;
+    Ok(())
+}
+
+fn trim_telegram_audit_log(path: &Path, max_bytes: u64) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read audit log metadata {}", path.display()))?;
+    if metadata.len() <= max_bytes {
+        return Ok(());
+    }
+
+    let content = fs::read(path)
+        .with_context(|| format!("failed to read audit log for trimming {}", path.display()))?;
+    let keep_from = content.len().saturating_sub(max_bytes as usize);
+    let trimmed = &content[keep_from..];
+    let start = trimmed
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    fs::write(path, &trimmed[start..])
+        .with_context(|| format!("failed to rewrite trimmed audit log {}", path.display()))?;
+    Ok(())
+}
+
+fn log_telegram_usage(config: &AppConfig, line: String) {
+    println!("{} {}", ui::info_label(), line);
+    if let Err(err) = append_telegram_audit_log(config, &line) {
+        eprintln!(
+            "Failed to write Telegram audit log at {}: {err}",
+            config.telegram.audit_log_path.display()
+        );
+    }
+}
+
+fn log_telegram_message_usage(
+    config: &AppConfig,
+    message: &frankenstein::Message,
+    allowed: bool,
+    action: &str,
+    detail: &str,
+) {
+    let username = message
+        .from
+        .as_ref()
+        .and_then(|user| user.username.as_deref())
+        .unwrap_or("-");
+    let user_id = message.from.as_ref().map(|user| user.id).unwrap_or_default();
+    let line = format!(
+        "telegram usage ts={} type=message allowed={} chat_id={} user_id={} username={} action={} detail={}",
+        unix_timestamp_secs(),
+        allowed,
+        message.chat.id,
+        user_id,
+        username,
+        action,
+        truncate_audit_value(detail, 120)
+    );
+    log_telegram_usage(config, line);
+}
+
+fn log_telegram_callback_usage(
+    config: &AppConfig,
+    callback_query: &frankenstein::CallbackQuery,
+    allowed: bool,
+    action: &str,
+    detail: &str,
+) {
+    let username = callback_query.from.username.as_deref().unwrap_or("-");
+    let chat_id = callback_query
+        .message
+        .as_ref()
+        .map(|message| message.chat.id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let line = format!(
+        "telegram usage ts={} type=callback allowed={} chat_id={} user_id={} username={} action={} detail={}",
+        unix_timestamp_secs(),
+        allowed,
+        chat_id,
+        callback_query.from.id,
+        username,
+        action,
+        truncate_audit_value(detail, 120)
+    );
+    log_telegram_usage(config, line);
+}
+
+fn send_access_request_to_admins(
+    bot_token: &str,
+    admin_user_ids: &[u64],
+    requester_user_id: u64,
+) -> Result<usize> {
+    use frankenstein::{
+        InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, SendMessageParams, TelegramApi,
+    };
+
+    let api = frankenstein::Api::new(bot_token);
+    let keyboard = InlineKeyboardMarkup::builder()
+        .inline_keyboard(vec![vec![
+            InlineKeyboardButton::builder()
+                .text(format!("Approve {requester_user_id}"))
+                .callback_data(format!("approve:{requester_user_id}"))
+                .build(),
+        ]])
+        .build();
+    let text = format!(
+        "Access request received.\nUser ID: {requester_user_id}\nApprove with /approve {requester_user_id} or the button below."
+    );
+
+    let mut delivered = 0;
+    for admin_user_id in admin_user_ids {
+        let Ok(chat_id) = i64::try_from(*admin_user_id) else {
+            continue;
+        };
+        let params = SendMessageParams::builder()
+            .chat_id(chat_id)
+            .text(&text)
+            .reply_markup(ReplyMarkup::InlineKeyboardMarkup(keyboard.clone()))
+            .build();
+        if api.send_message(&params).is_ok() {
+            delivered += 1;
+        }
+    }
+
+    Ok(delivered)
+}
+
 fn edit_search_results_message(
     bot_token: &str,
     chat_id: i64,
@@ -301,6 +471,58 @@ fn answer_callback_query(
     };
     api.answer_callback_query(&params)?;
     Ok(())
+}
+
+fn write_telegram_allowed_user_ids(config_path: &Path, allowed_user_ids: &[u64]) -> Result<()> {
+    let original = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+    let mut root: toml::Value = toml::from_str(&original)
+        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    let root_table = root
+        .as_table_mut()
+        .context("config root must be a TOML table")?;
+    let telegram_value = root_table
+        .entry("telegram")
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+    let telegram_table = telegram_value
+        .as_table_mut()
+        .context("telegram section must be a TOML table")?;
+    let values = allowed_user_ids
+        .iter()
+        .map(|user_id| toml::Value::Integer(*user_id as i64))
+        .collect();
+    telegram_table.insert("allowed_user_ids".to_string(), toml::Value::Array(values));
+    let rewritten = toml::to_string_pretty(&root).context("failed to render updated config")?;
+    fs::write(config_path, rewritten)
+        .with_context(|| format!("failed to write config at {}", config_path.display()))
+}
+
+fn grant_telegram_user_access(
+    config_path: &Path,
+    config: &mut AppConfig,
+    user_id: u64,
+) -> Result<bool> {
+    if is_telegram_admin(config, user_id) || config.telegram.allowed_user_ids.contains(&user_id) {
+        return Ok(false);
+    }
+
+    config.telegram.allowed_user_ids.push(user_id);
+    config.telegram.allowed_user_ids.sort_unstable();
+    config.telegram.allowed_user_ids.dedup();
+    write_telegram_allowed_user_ids(config_path, &config.telegram.allowed_user_ids)?;
+    Ok(true)
+}
+
+fn notify_user_access_approved(bot_token: &str, user_id: u64) -> Result<()> {
+    let Ok(chat_id) = i64::try_from(user_id) else {
+        return Ok(());
+    };
+    send_text_to_chat(
+        bot_token,
+        chat_id,
+        "Your access request was approved. You can use the bot now.",
+        None,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -636,7 +858,8 @@ fn write_telegram_chat_id(config_path: &Path, chat_id: i64) -> Result<()> {
 
 fn poll_telegram_queries(
     db: &mut Connection,
-    config: &AppConfig,
+    config: &mut AppConfig,
+    config_path: &Path,
     state: &mut TelegramPollingState,
 ) -> Result<()> {
     if !config.telegram.enabled {
@@ -671,12 +894,20 @@ fn poll_telegram_queries(
             | UpdateContent::EditedMessage(message)
             | UpdateContent::ChannelPost(message)
             | UpdateContent::EditedChannelPost(message) => {
-                if let Err(err) = handle_telegram_query_message(db, config, state, &message) {
+                if let Err(err) =
+                    handle_telegram_query_message(db, config, config_path, state, &message)
+                {
                     eprintln!("Telegram query handling failed: {err}");
                 }
             }
             UpdateContent::CallbackQuery(callback_query) => {
-                if let Err(err) = handle_telegram_callback_query(db, config, state, &callback_query)
+                if let Err(err) = handle_telegram_callback_query(
+                    db,
+                    config,
+                    config_path,
+                    state,
+                    &callback_query,
+                )
                 {
                     eprintln!("Telegram callback handling failed: {err}");
                 }
@@ -690,7 +921,8 @@ fn poll_telegram_queries(
 
 fn handle_telegram_query_message(
     db: &mut Connection,
-    config: &AppConfig,
+    config: &mut AppConfig,
+    config_path: &Path,
     state: &mut TelegramPollingState,
     message: &frankenstein::Message,
 ) -> Result<()> {
@@ -698,9 +930,124 @@ fn handle_telegram_query_message(
         return Ok(());
     }
 
+    let Some(from_user) = message.from.as_ref() else {
+        return Ok(());
+    };
     let chat_id = message.chat.id;
     let reply_to_message_id = Some(message.message_id);
     let text = message.text.as_deref().unwrap_or("").trim();
+    let is_admin = is_telegram_admin(config, from_user.id);
+    let action = if is_new_command(text) {
+        "/new"
+    } else if is_recent_documents_command(text) {
+        "/start-or-show"
+    } else if is_clean_command(text) {
+        "/clean"
+    } else if is_join_command(text) {
+        "/join"
+    } else if parse_approve_command(text).is_some() || is_approve_command(text) {
+        "/approve"
+    } else if parse_search_command(text).is_some() {
+        "/s"
+    } else if message.document.is_some() {
+        "document"
+    } else if text.is_empty() {
+        "empty"
+    } else {
+        "text"
+    };
+    let detail = if let Some(document) = message.document.as_ref() {
+        document.file_name.as_deref().unwrap_or("telegram-document")
+    } else if text.is_empty() {
+        "<empty>"
+    } else {
+        text
+    };
+
+    if !is_telegram_user_allowed(config, from_user.id) {
+        log_telegram_message_usage(config, message, false, action, detail);
+        if is_join_command(text) {
+            let delivered =
+                send_access_request_to_admins(&config.telegram.bot_token, &config.telegram.admin_user_ids, from_user.id)?;
+            let response = if delivered == 0 {
+                format!(
+                    "No admin could be notified. Ask the owner to add your Telegram user ID {} manually.",
+                    from_user.id
+                )
+            } else {
+                format!(
+                    "Access request sent to {} admin(s).\nYour Telegram user ID: {}",
+                    delivered, from_user.id
+                )
+            };
+            send_text_to_chat(
+                &config.telegram.bot_token,
+                chat_id,
+                &response,
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+        send_text_to_chat(
+            &config.telegram.bot_token,
+            chat_id,
+            &format!(
+                "Unauthorized user.\nSend /join to request access.\nYour Telegram user ID: {}",
+                from_user.id
+            ),
+            reply_to_message_id,
+        )?;
+        return Ok(());
+    }
+
+    log_telegram_message_usage(config, message, true, action, detail);
+
+    if is_join_command(text) {
+        send_text_to_chat(
+            &config.telegram.bot_token,
+            chat_id,
+            "You already have access.",
+            reply_to_message_id,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(requested_user_id) = parse_approve_command(text) {
+        if !is_admin {
+            send_text_to_chat(
+                &config.telegram.bot_token,
+                chat_id,
+                "Admin only command.",
+                reply_to_message_id,
+            )?;
+            return Ok(());
+        }
+        let added = grant_telegram_user_access(config_path, config, requested_user_id)?;
+        let response = if added {
+            format!("Approved Telegram user ID {requested_user_id}.")
+        } else {
+            format!("Telegram user ID {requested_user_id} already has access.")
+        };
+        send_text_to_chat(
+            &config.telegram.bot_token,
+            chat_id,
+            &response,
+            reply_to_message_id,
+        )?;
+        if added {
+            notify_user_access_approved(&config.telegram.bot_token, requested_user_id)?;
+        }
+        return Ok(());
+    }
+    if is_approve_command(text) {
+        send_text_to_chat(
+            &config.telegram.bot_token,
+            chat_id,
+            "Usage: /approve <telegram_user_id>",
+            reply_to_message_id,
+        )?;
+        return Ok(());
+    }
 
     if is_new_command(text) {
         state.awaiting_new_chats.insert(chat_id);
@@ -805,10 +1152,11 @@ fn handle_telegram_query_message(
         return Ok(());
     }
     let Some(query) = parse_search_command(text) else {
+        let help = telegram_help_message(text, is_admin);
         send_text_to_chat(
             &config.telegram.bot_token,
             chat_id,
-            telegram_help_message(text),
+            &help,
             reply_to_message_id,
         )?;
         return Ok(());
@@ -1041,13 +1389,73 @@ fn find_latest_documents(db: &Connection, limit: usize) -> Result<Vec<QueryMatch
 
 fn handle_telegram_callback_query(
     db: &Connection,
-    config: &AppConfig,
+    config: &mut AppConfig,
+    config_path: &Path,
     state: &mut TelegramPollingState,
     callback_query: &frankenstein::CallbackQuery,
 ) -> Result<()> {
+    let callback_data = callback_query.data.as_deref().unwrap_or("");
+    let action = if parse_approve_callback(callback_data).is_some() {
+        "approve-callback"
+    } else if parse_page_callback(callback_data).is_some() {
+        "page-callback"
+    } else if parse_document_callback(callback_data).is_some() {
+        "document-callback"
+    } else {
+        "callback"
+    };
+    if !is_telegram_user_allowed(config, callback_query.from.id) {
+        log_telegram_callback_usage(config, callback_query, false, action, callback_data);
+        answer_callback_query(
+            &config.telegram.bot_token,
+            &callback_query.id,
+            Some("Unauthorized."),
+        )?;
+        return Ok(());
+    }
+
+    log_telegram_callback_usage(config, callback_query, true, action, callback_data);
+
     let Some(data) = callback_query.data.as_deref() else {
         return Ok(());
     };
+    if let Some(requested_user_id) = parse_approve_callback(data) {
+        if !is_telegram_admin(config, callback_query.from.id) {
+            answer_callback_query(
+                &config.telegram.bot_token,
+                &callback_query.id,
+                Some("Admin only."),
+            )?;
+            return Ok(());
+        }
+        let added = grant_telegram_user_access(config_path, config, requested_user_id)?;
+        answer_callback_query(
+            &config.telegram.bot_token,
+            &callback_query.id,
+            Some(if added {
+                "User approved."
+            } else {
+                "User already allowed."
+            }),
+        )?;
+        if let Some(message) = callback_query.message.as_ref() {
+            let response = if added {
+                format!("Approved Telegram user ID {requested_user_id}.")
+            } else {
+                format!("Telegram user ID {requested_user_id} already has access.")
+            };
+            send_text_to_chat(
+                &config.telegram.bot_token,
+                message.chat.id,
+                &response,
+                Some(message.message_id),
+            )?;
+        }
+        if added {
+            notify_user_access_approved(&config.telegram.bot_token, requested_user_id)?;
+        }
+        return Ok(());
+    }
     if let Some((session_id, page)) = parse_page_callback(data) {
         let Some(message) = callback_query.message.as_ref() else {
             answer_callback_query(
@@ -1263,6 +1671,18 @@ fn is_help_command(text: &str) -> bool {
     trimmed == "/help" || trimmed.starts_with("/help@")
 }
 
+fn is_telegram_user_allowed(config: &AppConfig, user_id: u64) -> bool {
+    if is_telegram_admin(config, user_id) {
+        return true;
+    }
+
+    config.telegram.allowed_user_ids.contains(&user_id)
+}
+
+fn is_telegram_admin(config: &AppConfig, user_id: u64) -> bool {
+    config.telegram.admin_user_ids.contains(&user_id)
+}
+
 fn is_recent_documents_command(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed == "/start"
@@ -1281,19 +1701,47 @@ fn is_new_command(text: &str) -> bool {
     trimmed == "/new" || trimmed.starts_with("/new@")
 }
 
-fn telegram_help_message(text: &str) -> &'static str {
+fn is_join_command(text: &str) -> bool {
     let trimmed = text.trim();
-    if is_help_command(trimmed) {
-        "Commands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/help show this help"
-    } else if trimmed.starts_with('/') {
-        "Unknown command.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/help show this help"
+    trimmed == "/join" || trimmed.starts_with("/join@")
+}
+
+fn parse_approve_command(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    let (command, rest) = trimmed.split_once(char::is_whitespace)?;
+    if command == "/approve" || command.starts_with("/approve@") {
+        return rest.trim().parse().ok();
+    }
+    None
+}
+
+fn is_approve_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed == "/approve" || trimmed.starts_with("/approve@")
+}
+
+fn telegram_help_message(text: &str, is_admin: bool) -> String {
+    let trimmed = text.trim();
+    let admin_line = if is_admin {
+        "\n/approve <user_id> admin only: grant access"
     } else {
-        "Send a command to continue.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/help show this help"
+        ""
+    };
+    if is_help_command(trimmed) {
+        format!("Commands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}")
+    } else if trimmed.starts_with('/') {
+        format!("Unknown command.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}")
+    } else {
+        format!("Send a command to continue.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}")
     }
 }
 
 fn parse_document_callback(data: &str) -> Option<i64> {
     data.strip_prefix("doc:")?.parse().ok()
+}
+
+fn parse_approve_callback(data: &str) -> Option<u64> {
+    data.strip_prefix("approve:")?.parse().ok()
 }
 
 fn parse_page_callback(data: &str) -> Option<(u64, usize)> {
@@ -2017,6 +2465,29 @@ fn run_doctor(config_override: Option<PathBuf>) -> Result<()> {
             ),
             || check_telegram(&config.telegram),
         ));
+        if config.telegram.admin_user_ids.is_empty() && config.telegram.allowed_user_ids.is_empty()
+        {
+            checks.push(DoctorCheck::warn(
+                "telegram.access",
+                "admin_user_ids and allowed_user_ids are empty; any Telegram user who can message the bot may use it",
+                format!(
+                    "Set {} and {} in {} to restrict the bot and allow admin approvals.",
+                    ui::value("telegram.admin_user_ids"),
+                    ui::value("telegram.allowed_user_ids"),
+                    loaded_config.path.display()
+                ),
+            ));
+        } else if config.telegram.admin_user_ids.is_empty() {
+            checks.push(DoctorCheck::warn(
+                "telegram.access",
+                "admin_user_ids is empty; access requests cannot be approved from Telegram",
+                format!(
+                    "Set {} in {} if you want to approve users with /approve or /join.",
+                    ui::value("telegram.admin_user_ids"),
+                    loaded_config.path.display()
+                ),
+            ));
+        }
         if config.telegram.chat_id == 0 {
             checks.push(DoctorCheck::warn(
                 "telegram.notifications",
@@ -2237,7 +2708,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let config = loaded_config.data;
+    let mut config = loaded_config.data;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut db = init_db(&config.database_path)?;
@@ -2264,6 +2735,10 @@ async fn main() -> Result<()> {
             ui::value(config.telegram.poll_interval_secs),
             ui::value(format!("{:.2}", config.telegram.match_accuracy))
         );
+        println!(
+            "Telegram audit log: {}",
+            ui::path(config.telegram.audit_log_path.display())
+        );
     }
 
     process_existing_documents(&mut db, &config)?;
@@ -2282,7 +2757,12 @@ async fn main() -> Result<()> {
                 }
             }
             _ = telegram_interval.tick(), if config.telegram.enabled => {
-                if let Err(err) = poll_telegram_queries(&mut db, &config, &mut telegram_state) {
+                if let Err(err) = poll_telegram_queries(
+                    &mut db,
+                    &mut config,
+                    &loaded_config.path,
+                    &mut telegram_state,
+                ) {
                     eprintln!("Telegram polling failed: {err}");
                 }
             }

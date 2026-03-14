@@ -37,6 +37,12 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
+    pub admin_user_ids: Vec<u64>,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<u64>,
+    #[serde(default = "default_telegram_audit_log_path")]
+    pub audit_log_path: PathBuf,
+    #[serde(default)]
     pub chat_id: i64,
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
@@ -95,6 +101,9 @@ impl Default for TelegramConfig {
         Self {
             enabled: false,
             bot_token: String::new(),
+            admin_user_ids: Vec::new(),
+            allowed_user_ids: Vec::new(),
+            audit_log_path: default_telegram_audit_log_path(),
             chat_id: 0,
             poll_interval_secs: default_poll_interval_secs(),
             match_accuracy: default_match_accuracy(),
@@ -168,6 +177,7 @@ impl AppConfig {
         self.database_path = resolve_path(config_dir, &self.database_path);
         self.processed_dir =
             resolve_processed_dir(&self.watch_dir, config_dir, &self.processed_dir);
+        self.telegram.audit_log_path = resolve_path(config_dir, &self.telegram.audit_log_path);
     }
 
     fn normalize(&mut self) {
@@ -185,6 +195,10 @@ impl AppConfig {
             .to_ascii_lowercase();
         self.embedding.fallback_provider =
             self.embedding.fallback_provider.trim().to_ascii_lowercase();
+        self.telegram.admin_user_ids.sort_unstable();
+        self.telegram.admin_user_ids.dedup();
+        self.telegram.allowed_user_ids.sort_unstable();
+        self.telegram.allowed_user_ids.dedup();
     }
 
     fn validate(&self) -> Result<()> {
@@ -222,6 +236,22 @@ impl AppConfig {
         }
         if !(0.0..=1.0).contains(&self.telegram.match_accuracy) {
             errors.push("telegram.match_accuracy must be between 0.0 and 1.0".to_string());
+        }
+        if self
+            .telegram
+            .admin_user_ids
+            .iter()
+            .any(|user_id| *user_id == 0)
+        {
+            errors.push("telegram.admin_user_ids must contain only positive Telegram user IDs".to_string());
+        }
+        if self
+            .telegram
+            .allowed_user_ids
+            .iter()
+            .any(|user_id| *user_id == 0)
+        {
+            errors.push("telegram.allowed_user_ids must contain only positive Telegram user IDs".to_string());
         }
         if let Err(err) = validate_provider_name(
             "embedding.preferred_provider",
@@ -452,6 +482,9 @@ fn render_default_config_template() -> String {
             "# - configure [embedding.ollama] for your primary provider\n",
             "# - if fallback_provider is \"gemini\", enable [embedding.gemini] and set api_key\n",
             "# - if telegram.enabled = true, set bot_token\n",
+            "# - set telegram.admin_user_ids for users who can approve access requests\n",
+            "# - set telegram.allowed_user_ids to restrict who can use the bot\n",
+            "# - telegram.audit_log_path stores Telegram usage logs\n",
             "# - optionally set chat_id for proactive notifications or use --telegram-discover-chat\n",
             "\n",
             "watch_dir = \"{watch_dir}\"\n",
@@ -462,6 +495,9 @@ fn render_default_config_template() -> String {
             "[telegram]\n",
             "enabled = false\n",
             "bot_token = \"PASTE_TELEGRAM_BOT_TOKEN_HERE\"\n",
+            "admin_user_ids = [123456789]\n",
+            "allowed_user_ids = [123456789]\n",
+            "audit_log_path = \"{telegram_audit_log_path}\"\n",
             "chat_id = 0\n",
             "poll_interval_secs = {poll_interval_secs}\n",
             "match_accuracy = {match_accuracy}\n",
@@ -483,6 +519,7 @@ fn render_default_config_template() -> String {
         watch_dir = config.watch_dir.display(),
         database_path = config.database_path.display(),
         processed_dir = config.processed_dir.display(),
+        telegram_audit_log_path = config.telegram.audit_log_path.display(),
         poll_interval_secs = config.telegram.poll_interval_secs,
         match_accuracy = config.telegram.match_accuracy,
         ollama_base_url = config.embedding.ollama.base_url,
@@ -513,6 +550,12 @@ fn default_processed_dir() -> PathBuf {
 
 fn default_processed_dir_name() -> &'static str {
     "processed"
+}
+
+fn default_telegram_audit_log_path() -> PathBuf {
+    project_dirs()
+        .map(|dirs| dirs.data_local_dir().join("telegram-activity.log"))
+        .unwrap_or_else(|| PathBuf::from("telegram-activity.log"))
 }
 
 fn default_preferred_provider() -> String {
