@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use directories::{BaseDirs, ProjectDirs};
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 const APP_DIR_NAME: &str = "note-embedding";
@@ -44,10 +46,37 @@ pub struct TelegramConfig {
     pub audit_log_path: PathBuf,
     #[serde(default)]
     pub chat_id: i64,
+    #[serde(default)]
+    pub mode: TelegramMode,
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub webhook_url: String,
+    #[serde(default = "default_telegram_webhook_bind_addr")]
+    pub webhook_bind_addr: String,
+    #[serde(default)]
+    pub webhook_secret_token: String,
+    #[serde(default = "default_telegram_webhook_trusted_proxy_cidrs")]
+    pub webhook_trusted_proxy_cidrs: Vec<String>,
     #[serde(default = "default_match_accuracy")]
     pub match_accuracy: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramMode {
+    #[default]
+    Polling,
+    Webhook,
+}
+
+impl TelegramMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Polling => "polling",
+            Self::Webhook => "webhook",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +134,12 @@ impl Default for TelegramConfig {
             allowed_user_ids: Vec::new(),
             audit_log_path: default_telegram_audit_log_path(),
             chat_id: 0,
+            mode: TelegramMode::default(),
             poll_interval_secs: default_poll_interval_secs(),
+            webhook_url: String::new(),
+            webhook_bind_addr: default_telegram_webhook_bind_addr(),
+            webhook_secret_token: String::new(),
+            webhook_trusted_proxy_cidrs: default_telegram_webhook_trusted_proxy_cidrs(),
             match_accuracy: default_match_accuracy(),
         }
     }
@@ -195,6 +229,17 @@ impl AppConfig {
             .to_ascii_lowercase();
         self.embedding.fallback_provider =
             self.embedding.fallback_provider.trim().to_ascii_lowercase();
+        self.telegram.bot_token = self.telegram.bot_token.trim().to_string();
+        self.telegram.webhook_url = self.telegram.webhook_url.trim().to_string();
+        self.telegram.webhook_bind_addr = self.telegram.webhook_bind_addr.trim().to_string();
+        self.telegram.webhook_secret_token = self.telegram.webhook_secret_token.trim().to_string();
+        self.telegram.webhook_trusted_proxy_cidrs = self
+            .telegram
+            .webhook_trusted_proxy_cidrs
+            .iter()
+            .map(|cidr| cidr.trim().to_string())
+            .filter(|cidr| !cidr.is_empty())
+            .collect();
         self.telegram.admin_user_ids.sort_unstable();
         self.telegram.admin_user_ids.dedup();
         self.telegram.allowed_user_ids.sort_unstable();
@@ -231,8 +276,64 @@ impl AppConfig {
         if self.telegram.enabled && is_blank_or_placeholder(&self.telegram.bot_token) {
             errors.push("telegram.enabled is true but telegram.bot_token is empty".to_string());
         }
-        if self.telegram.poll_interval_secs == 0 {
-            errors.push("telegram.poll_interval_secs must be greater than 0".to_string());
+        match self.telegram.mode {
+            TelegramMode::Polling => {
+                if self.telegram.poll_interval_secs == 0 {
+                    errors.push("telegram.poll_interval_secs must be greater than 0".to_string());
+                }
+            }
+            TelegramMode::Webhook => {
+                if self.telegram.enabled && is_blank_or_placeholder(&self.telegram.webhook_url) {
+                    errors.push(
+                        "telegram.mode is webhook but telegram.webhook_url is empty".to_string(),
+                    );
+                } else if !self.telegram.webhook_url.starts_with("https://") {
+                    errors.push(
+                        "telegram.webhook_url must start with https:// in webhook mode".to_string(),
+                    );
+                }
+                if self.telegram.webhook_bind_addr.is_empty() {
+                    errors.push(
+                        "telegram.mode is webhook but telegram.webhook_bind_addr is empty"
+                            .to_string(),
+                    );
+                } else if self
+                    .telegram
+                    .webhook_bind_addr
+                    .parse::<SocketAddr>()
+                    .is_err()
+                {
+                    errors.push(
+                        "telegram.webhook_bind_addr must be a valid socket address like 127.0.0.1:8080"
+                            .to_string(),
+                    );
+                }
+                if self.telegram.enabled
+                    && is_blank_or_placeholder(&self.telegram.webhook_secret_token)
+                {
+                    errors.push(
+                        "telegram.mode is webhook but telegram.webhook_secret_token is empty"
+                            .to_string(),
+                    );
+                } else if !self
+                    .telegram
+                    .webhook_secret_token
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                {
+                    errors.push(
+                        "telegram.webhook_secret_token must contain only letters, numbers, underscores, or hyphens"
+                            .to_string(),
+                    );
+                }
+                for cidr in &self.telegram.webhook_trusted_proxy_cidrs {
+                    if cidr.parse::<IpNet>().is_err() {
+                        errors.push(format!(
+                            "telegram.webhook_trusted_proxy_cidrs contains invalid CIDR {cidr}"
+                        ));
+                    }
+                }
+            }
         }
         if !(0.0..=1.0).contains(&self.telegram.match_accuracy) {
             errors.push("telegram.match_accuracy must be between 0.0 and 1.0".to_string());
@@ -243,7 +344,9 @@ impl AppConfig {
             .iter()
             .any(|user_id| *user_id == 0)
         {
-            errors.push("telegram.admin_user_ids must contain only positive Telegram user IDs".to_string());
+            errors.push(
+                "telegram.admin_user_ids must contain only positive Telegram user IDs".to_string(),
+            );
         }
         if self
             .telegram
@@ -251,7 +354,10 @@ impl AppConfig {
             .iter()
             .any(|user_id| *user_id == 0)
         {
-            errors.push("telegram.allowed_user_ids must contain only positive Telegram user IDs".to_string());
+            errors.push(
+                "telegram.allowed_user_ids must contain only positive Telegram user IDs"
+                    .to_string(),
+            );
         }
         if let Err(err) = validate_provider_name(
             "embedding.preferred_provider",
@@ -485,6 +591,13 @@ fn render_default_config_template() -> String {
             "# - set telegram.admin_user_ids for users who can approve access requests\n",
             "# - set telegram.allowed_user_ids to restrict who can use the bot\n",
             "# - telegram.audit_log_path stores Telegram usage logs\n",
+            "# - telegram.mode defaults to polling; set it to webhook to receive Telegram webhooks\n",
+            "# - when using webhook mode, set webhook_url, webhook_bind_addr, and webhook_secret_token\n",
+            "# - webhook mode only accepts requests from Cloudflare IP ranges and logs every sender to telegram.audit_log_path\n",
+            "# - if you run cloudflared or another local reverse proxy, set webhook_trusted_proxy_cidrs to only that proxy\n",
+            "# - tip: run `note-embedding --doctor` after enabling webhook mode; doctor can generate webhook_secret_token\n",
+            "#   and prompt for webhook_url when those values are missing or invalid\n",
+            "# - tip: to generate webhook_secret_token yourself, you can run: openssl rand -hex 24\n",
             "# - optionally set chat_id for proactive notifications or use --telegram-discover-chat\n",
             "\n",
             "watch_dir = \"{watch_dir}\"\n",
@@ -499,7 +612,12 @@ fn render_default_config_template() -> String {
             "allowed_user_ids = [123456789]\n",
             "audit_log_path = \"{telegram_audit_log_path}\"\n",
             "chat_id = 0\n",
+            "mode = \"{telegram_mode}\"\n",
             "poll_interval_secs = {poll_interval_secs}\n",
+            "webhook_url = \"\"\n",
+            "webhook_bind_addr = \"{telegram_webhook_bind_addr}\"\n",
+            "webhook_secret_token = \"\"\n",
+            "webhook_trusted_proxy_cidrs = [\"127.0.0.1/32\", \"::1/128\"]\n",
             "match_accuracy = {match_accuracy}\n",
             "\n",
             "[embedding]\n",
@@ -520,7 +638,9 @@ fn render_default_config_template() -> String {
         database_path = config.database_path.display(),
         processed_dir = config.processed_dir.display(),
         telegram_audit_log_path = config.telegram.audit_log_path.display(),
+        telegram_mode = config.telegram.mode.as_str(),
         poll_interval_secs = config.telegram.poll_interval_secs,
+        telegram_webhook_bind_addr = config.telegram.webhook_bind_addr,
         match_accuracy = config.telegram.match_accuracy,
         ollama_base_url = config.embedding.ollama.base_url,
         ollama_model = config.embedding.ollama.model,
@@ -584,6 +704,14 @@ fn default_gemini_model() -> String {
 
 fn default_poll_interval_secs() -> u64 {
     5
+}
+
+fn default_telegram_webhook_bind_addr() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+fn default_telegram_webhook_trusted_proxy_cidrs() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
 }
 
 fn default_match_accuracy() -> f32 {

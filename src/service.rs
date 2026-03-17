@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, resolve_config_path};
+use crate::telegram::delete_registered_webhook;
 use crate::ui;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -127,6 +128,7 @@ fn stop_service() -> Result<()> {
 
 fn uninstall_service(config_override: Option<PathBuf>) -> Result<()> {
     let paths = ServicePaths::resolve(config_override)?;
+    cleanup_telegram_webhook(&paths.config_path);
 
     if systemd_available() {
         let _ = run_command(
@@ -160,6 +162,33 @@ fn uninstall_service(config_override: Option<PathBuf>) -> Result<()> {
         ui::value(SERVICE_NAME)
     );
     Ok(())
+}
+
+fn cleanup_telegram_webhook(config_path: &Path) {
+    if !config_path.exists() {
+        return;
+    }
+
+    match AppConfig::load_or_create(Some(config_path.to_path_buf())) {
+        Ok(loaded) if !loaded.created => {
+            if loaded.data.telegram.bot_token.trim().is_empty() {
+                return;
+            }
+            if let Err(err) = delete_registered_webhook(&loaded.data.telegram) {
+                eprintln!(
+                    "Failed to delete Telegram webhook during uninstall using {}: {err:#}",
+                    config_path.display()
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!(
+                "Failed to load config {} for Telegram webhook cleanup during uninstall: {err:#}",
+                config_path.display()
+            );
+        }
+    }
 }
 
 fn install_service_files(paths: &ServicePaths) -> Result<()> {

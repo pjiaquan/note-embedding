@@ -4,25 +4,38 @@ mod telegram;
 mod ui;
 
 use anyhow::{Context, Result, bail};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode, Uri},
+    routing::post,
+};
 use clap::Parser;
 use config::{
-    AppConfig, TelegramConfig, create_default_config_if_missing, populate_missing_config_fields,
-    resolve_config_path,
+    AppConfig, TelegramConfig, TelegramMode, create_default_config_if_missing,
+    populate_missing_config_fields, resolve_config_path,
 };
+use ipnet::IpNet;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use rand::{Rng, distributions::Alphanumeric, rngs::OsRng};
 use rusqlite::Connection;
 use service::{ServiceAction, handle_service_action};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use telegram::{
-    answer_callback_query, log_telegram_callback_usage, log_telegram_message_usage,
-    notify_user_access_approved, register_bot_commands, send_access_request_to_admins,
-    send_document_content_to_chat, send_document_to_chat, send_text_to_chat,
-    send_text_to_chat_with_command_keyboard, send_text_to_chat_with_document_button,
-    send_to_telegram, send_to_telegram_with_document_button,
+    answer_callback_query, delete_registered_webhook, install_telegram_audit_log_path,
+    log_telegram_callback_usage, log_telegram_message_usage, log_telegram_outbound_result,
+    log_telegram_webhook_request, notify_user_access_approved, register_bot_commands,
+    send_access_request_to_admins, send_document_content_to_chat, send_document_to_chat,
+    send_text_to_chat, send_text_to_chat_with_command_keyboard,
+    send_text_to_chat_with_document_button, send_to_telegram,
+    send_to_telegram_with_document_button, with_telegram_api_retry,
 };
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
@@ -34,7 +47,7 @@ use walkdir::WalkDir;
     version,
     about = "Watch a directory and index new notes for embedding workflows.",
     long_about = "Watch a directory and index new notes for embedding workflows.\n\nOn first run, the program creates a config template and exits.\nEdit the config file, then start the program again.\n\nDefault config path:\n  ~/.config/note-embedding/config",
-    after_long_help = "Examples:\n  note-embedding\n  note-embedding --doctor\n  note-embedding --telegram-discover-chat\n  note-embedding --service start\n  note-embedding --service status\n  note-embedding --service log\n  note-embedding --config ~/.config/note-embedding/config\n  NOTE_EMBEDDING_CONFIG=~/.config/note-embedding/config note-embedding\n\nBuild:\n  cargo build --release\n\nFirst-run setup:\n  1. Run the program once to create the config template.\n  2. Edit watch_dir, file_types, Telegram settings, and embedding providers.\n  3. Run --telegram-discover-chat after sending a message to the bot.\n  4. Run --doctor to verify the setup.\n\nService install:\n  1. Build the binary: cargo build --release\n  2. Run the binary once: ./target/release/note-embedding\n  3. Edit ~/.config/note-embedding/config\n  4. Verify setup: ./target/release/note-embedding --doctor\n  5. Install and start the user service: ./target/release/note-embedding --service start\n\nService commands:\n  --service start      install/update and start the user service\n  --service status     show systemd user service status\n  --service log        show recent journald logs\n  --service restart    restart the user service\n  --service stop       stop the user service\n  --service uninstall  remove the user service, symlink, config, and data\n\nNotes:\n  - service management uses systemd --user\n  - the installed command symlink is ~/.local/bin/note-embedding\n  - the unit file is ~/.config/systemd/user/note-embedding.service"
+    after_long_help = "Examples:\n  note-embedding\n  note-embedding --doctor\n  note-embedding --telegram-discover-chat\n  note-embedding --telegram-delete-webhook\n  note-embedding --service start\n  note-embedding --service status\n  note-embedding --service log\n  note-embedding --config ~/.config/note-embedding/config\n  NOTE_EMBEDDING_CONFIG=~/.config/note-embedding/config note-embedding\n\nBuild:\n  cargo build --release\n\nFirst-run setup:\n  1. Run the program once to create the config template.\n  2. Edit watch_dir, file_types, Telegram settings, and embedding providers.\n  3. Run --telegram-discover-chat after sending a message to the bot.\n  4. Run --doctor to verify the setup.\n\nService install:\n  1. Build the binary: cargo build --release\n  2. Run the binary once: ./target/release/note-embedding\n  3. Edit ~/.config/note-embedding/config\n  4. Verify setup: ./target/release/note-embedding --doctor\n  5. Install and start the user service: ./target/release/note-embedding --service start\n\nService commands:\n  --service start      install/update and start the user service\n  --service status     show systemd user service status\n  --service log        show recent journald logs\n  --service restart    restart the user service\n  --service stop       stop the user service\n  --service uninstall  remove the user service, symlink, config, and data\n\nNotes:\n  - service management uses systemd --user\n  - the installed command symlink is ~/.local/bin/note-embedding\n  - the unit file is ~/.config/systemd/user/note-embedding.service"
 )]
 struct Cli {
     /// Override the config file path.
@@ -53,6 +66,10 @@ struct Cli {
     /// Discover recent Telegram chats seen by the bot and write telegram.chat_id to config.
     #[arg(long)]
     telegram_discover_chat: bool,
+
+    /// Delete the Telegram webhook registered for telegram.bot_token in config.
+    #[arg(long)]
+    telegram_delete_webhook: bool,
 
     /// Manage the background user service.
     #[arg(long, value_enum, value_name = "ACTION")]
@@ -153,7 +170,6 @@ fn send_text_to_chat_with_search_results(
 ) -> Result<()> {
     use frankenstein::{ReplyMarkup, SendMessageParams, TelegramApi};
 
-    let api = frankenstein::Api::new(bot_token);
     let message = render_search_results_message(session, page);
     let inline_keyboard = build_search_results_keyboard(session_id, session, page);
 
@@ -170,7 +186,31 @@ fn send_text_to_chat_with_search_results(
             .reply_markup(ReplyMarkup::InlineKeyboardMarkup(inline_keyboard))
             .build(),
     };
-    api.send_message(&send_message_params)?;
+    let result = with_telegram_api_retry(bot_token, "sendMessage", |api| {
+        api.send_message(&send_message_params)
+    });
+    match result {
+        Ok(response) => {
+            log_telegram_outbound_result(
+                "sendMessage",
+                Some(chat_id),
+                reply_to_message_id,
+                &message,
+                None,
+            );
+            Ok(response)
+        }
+        Err(err) => {
+            log_telegram_outbound_result(
+                "sendMessage",
+                Some(chat_id),
+                reply_to_message_id,
+                &message,
+                Some(&err.to_string()),
+            );
+            Err(err)
+        }
+    }?;
     Ok(())
 }
 
@@ -184,18 +224,56 @@ fn edit_search_results_message(
 ) -> Result<()> {
     use frankenstein::{EditMessageTextParams, TelegramApi};
 
-    let api = frankenstein::Api::new(bot_token);
     let params = EditMessageTextParams::builder()
         .chat_id(chat_id)
         .message_id(message_id)
         .text(render_search_results_message(session, page))
         .reply_markup(build_search_results_keyboard(session_id, session, page))
         .build();
-    api.edit_message_text(&params)?;
+    let detail = format!("message_id={message_id} session_id={session_id} page={page}");
+    let result = with_telegram_api_retry(bot_token, "editMessageText", |api| {
+        api.edit_message_text(&params)
+    });
+    match result {
+        Ok(response) => {
+            log_telegram_outbound_result(
+                "editMessageText",
+                Some(chat_id),
+                Some(message_id),
+                &detail,
+                None,
+            );
+            Ok(response)
+        }
+        Err(err) => {
+            log_telegram_outbound_result(
+                "editMessageText",
+                Some(chat_id),
+                Some(message_id),
+                &detail,
+                Some(&err.to_string()),
+            );
+            Err(err)
+        }
+    }?;
     Ok(())
 }
 
 fn write_telegram_allowed_user_ids(config_path: &Path, allowed_user_ids: &[u64]) -> Result<()> {
+    update_telegram_config(config_path, |telegram_table| {
+        let values = allowed_user_ids
+            .iter()
+            .map(|user_id| toml::Value::Integer(*user_id as i64))
+            .collect();
+        telegram_table.insert("allowed_user_ids".to_string(), toml::Value::Array(values));
+        Ok(())
+    })
+}
+
+fn update_telegram_config<F>(config_path: &Path, update: F) -> Result<()>
+where
+    F: FnOnce(&mut toml::value::Table) -> Result<()>,
+{
     let original = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config at {}", config_path.display()))?;
     let mut root: toml::Value = toml::from_str(&original)
@@ -209,11 +287,7 @@ fn write_telegram_allowed_user_ids(config_path: &Path, allowed_user_ids: &[u64])
     let telegram_table = telegram_value
         .as_table_mut()
         .context("telegram section must be a TOML table")?;
-    let values = allowed_user_ids
-        .iter()
-        .map(|user_id| toml::Value::Integer(*user_id as i64))
-        .collect();
-    telegram_table.insert("allowed_user_ids".to_string(), toml::Value::Array(values));
+    update(telegram_table)?;
     let rewritten = toml::to_string_pretty(&root).context("failed to render updated config")?;
     fs::write(config_path, rewritten)
         .with_context(|| format!("failed to write config at {}", config_path.display()))
@@ -269,11 +343,20 @@ struct GeminiEmbedding {
 }
 
 #[derive(Debug, Default)]
-struct TelegramPollingState {
+struct TelegramRuntimeState {
     next_offset: Option<u32>,
     next_search_session_id: u64,
     awaiting_new_chats: HashSet<i64>,
     search_sessions: HashMap<u64, SearchSession>,
+}
+
+#[derive(Clone)]
+struct TelegramWebhookAppState {
+    secret_token: Option<String>,
+    tx: mpsc::UnboundedSender<frankenstein::Update>,
+    audit_log_path: PathBuf,
+    cloudflare_ip_ranges: Arc<[IpNet]>,
+    trusted_proxy_cidrs: Arc<[IpNet]>,
 }
 
 #[derive(Debug, Clone)]
@@ -282,19 +365,33 @@ struct SearchSession {
 }
 
 fn check_telegram(config: &TelegramConfig) -> Result<String> {
+    use frankenstein::TelegramApi;
+
     if !config.enabled {
         return Ok("disabled".to_string());
     }
 
-    use frankenstein::TelegramApi;
-    let api = frankenstein::Api::new(&config.bot_token);
-    let me = api.get_me().context("Telegram getMe request failed")?;
-    Ok(format!(
-        "authenticated as @{}",
-        me.result
-            .username
-            .unwrap_or_else(|| "<no-username>".to_string())
-    ))
+    let me = with_telegram_api_retry(&config.bot_token, "getMe", |api| api.get_me())
+        .context("Telegram getMe request failed")?;
+    let username = me
+        .result
+        .username
+        .unwrap_or_else(|| "<no-username>".to_string());
+    let transport = match config.mode {
+        TelegramMode::Polling => "polling".to_string(),
+        TelegramMode::Webhook => {
+            let webhook = with_telegram_api_retry(&config.bot_token, "getWebhookInfo", |api| {
+                api.get_webhook_info()
+            })
+            .context("Telegram getWebhookInfo request failed")?;
+            if webhook.result.url.is_empty() {
+                "webhook not registered".to_string()
+            } else {
+                format!("webhook registered at {}", webhook.result.url)
+            }
+        }
+    };
+    Ok(format!("authenticated as @{username}; {transport}"))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -310,6 +407,9 @@ struct TelegramChatCandidate {
     title: String,
     source: &'static str,
 }
+
+const CLOUDFLARE_IPS_V4_URL: &str = "https://www.cloudflare.com/ips-v4";
+const CLOUDFLARE_IPS_V6_URL: &str = "https://www.cloudflare.com/ips-v6";
 
 fn discover_telegram_chat(config_override: Option<PathBuf>) -> Result<()> {
     let config_path = resolve_config_path(config_override)?;
@@ -338,6 +438,11 @@ fn discover_telegram_chat(config_override: Option<PathBuf>) -> Result<()> {
         bail!(
             "telegram.bot_token is not configured in {}; set it before discovering chats",
             config_path.display()
+        );
+    }
+    if telegram.mode == TelegramMode::Webhook {
+        bail!(
+            "--telegram-discover-chat requires telegram.mode = \"polling\" because Telegram disables getUpdates while a webhook is active"
         );
     }
 
@@ -374,7 +479,6 @@ fn discover_telegram_chat(config_override: Option<PathBuf>) -> Result<()> {
 fn fetch_telegram_chat_candidates(bot_token: &str) -> Result<Vec<TelegramChatCandidate>> {
     use frankenstein::{AllowedUpdate, GetUpdatesParams, TelegramApi, UpdateContent};
 
-    let api = frankenstein::Api::new(bot_token);
     let params = GetUpdatesParams::builder()
         .limit(100_u32)
         .allowed_updates(vec![
@@ -388,8 +492,7 @@ fn fetch_telegram_chat_candidates(bot_token: &str) -> Result<Vec<TelegramChatCan
         ])
         .build();
 
-    let updates = api
-        .get_updates(&params)
+    let updates = with_telegram_api_retry(bot_token, "getUpdates", |api| api.get_updates(&params))
         .context("Telegram getUpdates request failed")?
         .result;
     let mut chats = BTreeMap::<i64, TelegramChatCandidate>::new();
@@ -437,6 +540,220 @@ fn fetch_telegram_chat_candidates(bot_token: &str) -> Result<Vec<TelegramChatCan
     }
 
     Ok(chats.into_values().collect())
+}
+
+fn telegram_runtime_allowed_updates() -> Vec<frankenstein::AllowedUpdate> {
+    use frankenstein::AllowedUpdate;
+
+    vec![
+        AllowedUpdate::Message,
+        AllowedUpdate::EditedMessage,
+        AllowedUpdate::ChannelPost,
+        AllowedUpdate::EditedChannelPost,
+        AllowedUpdate::CallbackQuery,
+    ]
+}
+
+fn fetch_cloudflare_ip_ranges() -> Result<Vec<IpNet>> {
+    let mut ranges = Vec::new();
+    for url in [CLOUDFLARE_IPS_V4_URL, CLOUDFLARE_IPS_V6_URL] {
+        let response = ureq::get(url)
+            .call()
+            .with_context(|| format!("failed to fetch Cloudflare IP ranges from {url}"))?;
+        let body = response
+            .into_string()
+            .with_context(|| format!("failed to read Cloudflare IP ranges from {url}"))?;
+        for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let network = line
+                .parse::<IpNet>()
+                .with_context(|| format!("invalid Cloudflare IP range '{line}' from {url}"))?;
+            ranges.push(network);
+        }
+    }
+
+    if ranges.is_empty() {
+        bail!("Cloudflare IP range list is empty");
+    }
+
+    Ok(ranges)
+}
+
+fn can_bind_telegram_webhook(bind_addr: SocketAddr) -> Result<String> {
+    let listener = StdTcpListener::bind(bind_addr)
+        .with_context(|| format!("failed to bind Telegram webhook listener at {bind_addr}"))?;
+    drop(listener);
+    Ok(format!("{bind_addr} is available for the webhook listener"))
+}
+
+fn prompt_input(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read input from stdin")?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
+    loop {
+        let suffix = if default_yes { " [Y/n]: " } else { " [y/N]: " };
+        let answer = prompt_input(&format!("{prompt}{suffix}"))?;
+        if answer.is_empty() {
+            return Ok(default_yes);
+        }
+
+        match answer.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("{} Enter y or n.", ui::warn_label()),
+        }
+    }
+}
+
+fn prompt_required_https_url(prompt: &str) -> Result<String> {
+    loop {
+        let value = prompt_input(prompt)?;
+        if value.is_empty() {
+            println!("{} Value cannot be empty.", ui::warn_label());
+            continue;
+        }
+        if !value.starts_with("https://") {
+            println!(
+                "{} Webhook URL must start with https:// for Telegram webhook mode.",
+                ui::warn_label()
+            );
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
+fn generate_webhook_secret_token() -> String {
+    OsRng
+        .sample_iter(&Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect()
+}
+
+fn prompt_webhook_secret_token() -> Result<String> {
+    if prompt_yes_no("Generate a secure webhook secret token now?", true)? {
+        return Ok(generate_webhook_secret_token());
+    }
+
+    loop {
+        let value = prompt_input("Enter telegram.webhook_secret_token: ")?;
+        if value.is_empty() {
+            println!("{} Value cannot be empty.", ui::warn_label());
+            continue;
+        }
+        if !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            println!(
+                "{} Secret token may only contain letters, numbers, underscores, or hyphens.",
+                ui::warn_label()
+            );
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
+fn interactive_doctor_prepare_config(config_path: &Path) -> Result<()> {
+    let config_text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+    let discovery_config: TelegramDiscoveryConfig = toml::from_str(&config_text)
+        .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+    let telegram = discovery_config.telegram;
+
+    if !telegram.enabled || telegram.mode != TelegramMode::Webhook {
+        return Ok(());
+    }
+
+    let mut updated_fields = Vec::new();
+
+    let token_missing = telegram.webhook_secret_token.trim().is_empty();
+    let token_invalid = !token_missing
+        && !telegram
+            .webhook_secret_token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if token_missing || token_invalid {
+        println!(
+            "{} webhook mode requires a valid {}.",
+            ui::info_label(),
+            ui::value("telegram.webhook_secret_token")
+        );
+        let token = prompt_webhook_secret_token()?;
+        update_telegram_config(config_path, |telegram_table| {
+            telegram_table.insert(
+                "webhook_secret_token".to_string(),
+                toml::Value::String(token.clone()),
+            );
+            Ok(())
+        })?;
+        updated_fields.push("telegram.webhook_secret_token");
+    }
+
+    let url_missing = telegram.webhook_url.trim().is_empty();
+    let url_invalid = !url_missing && !telegram.webhook_url.starts_with("https://");
+    if url_missing || url_invalid {
+        println!(
+            "{} webhook mode requires a valid {}.",
+            ui::info_label(),
+            ui::value("telegram.webhook_url")
+        );
+        let webhook_url =
+            prompt_required_https_url("Enter telegram.webhook_url (public https URL): ")?;
+        update_telegram_config(config_path, |telegram_table| {
+            telegram_table.insert(
+                "webhook_url".to_string(),
+                toml::Value::String(webhook_url.clone()),
+            );
+            Ok(())
+        })?;
+        updated_fields.push("telegram.webhook_url");
+    }
+
+    if !updated_fields.is_empty() {
+        println!(
+            "{} Updated {} in {}",
+            ui::ok_label(),
+            updated_fields.join(", "),
+            ui::path(config_path.display())
+        );
+    }
+
+    Ok(())
+}
+
+fn is_cloudflare_ip(peer_ip: IpAddr, cloudflare_ip_ranges: &[IpNet]) -> bool {
+    cloudflare_ip_ranges
+        .iter()
+        .any(|network| network.contains(&peer_ip))
+}
+
+fn is_trusted_proxy_ip(peer_ip: IpAddr, trusted_proxy_cidrs: &[IpNet]) -> bool {
+    trusted_proxy_cidrs
+        .iter()
+        .any(|network| network.contains(&peer_ip))
+}
+
+fn parse_trusted_proxy_cidrs(cidrs: &[String]) -> Result<Vec<IpNet>> {
+    cidrs
+        .iter()
+        .map(|cidr| {
+            cidr.parse::<IpNet>()
+                .with_context(|| format!("invalid trusted proxy CIDR {cidr}"))
+        })
+        .collect()
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn format_chat_title(chat: &frankenstein::Chat) -> String {
@@ -566,74 +883,289 @@ fn write_telegram_chat_id(config_path: &Path, chat_id: i64) -> Result<()> {
         .with_context(|| format!("failed to write config at {}", config_path.display()))
 }
 
+fn delete_telegram_webhook_command(config_override: Option<PathBuf>) -> Result<()> {
+    let loaded_config = AppConfig::load_or_create(config_override)?;
+
+    if loaded_config.created {
+        println!(
+            "{} Created config template: {}",
+            ui::info_label(),
+            ui::path(loaded_config.path.display())
+        );
+        println!(
+            "Set {} then run {} again.",
+            ui::value("telegram.bot_token"),
+            ui::command("note-embedding --telegram-delete-webhook")
+        );
+        return Ok(());
+    }
+
+    let config = loaded_config.data;
+    if config.telegram.bot_token.trim().is_empty() {
+        bail!(
+            "telegram.bot_token is not configured in {}; set it before deleting the webhook",
+            loaded_config.path.display()
+        );
+    }
+
+    delete_registered_webhook(&config.telegram).context("failed to delete Telegram webhook")?;
+    println!(
+        "{} Deleted Telegram webhook for bot configured in {}",
+        ui::ok_label(),
+        ui::path(loaded_config.path.display())
+    );
+    Ok(())
+}
+
+fn configure_telegram_transport(config: &TelegramConfig) -> Result<()> {
+    use frankenstein::{DeleteWebhookParams, SetWebhookParams, TelegramApi};
+
+    match config.mode {
+        TelegramMode::Polling => {
+            let params = DeleteWebhookParams::builder().build();
+            with_telegram_api_retry(&config.bot_token, "deleteWebhook", |api| {
+                api.delete_webhook(&params)
+            })
+            .context("Telegram deleteWebhook request failed")?;
+        }
+        TelegramMode::Webhook => {
+            let webhook_info =
+                with_telegram_api_retry(&config.bot_token, "getWebhookInfo", |api| {
+                    api.get_webhook_info()
+                })
+                .context("Telegram getWebhookInfo request failed")?;
+            let current = webhook_info.result;
+            let webhook_is_current = current.url == config.webhook_url
+                && current.last_error_date.is_none()
+                && current.last_error_message.is_none()
+                && current.last_synchronization_error_date.is_none();
+            if webhook_is_current {
+                return Ok(());
+            }
+
+            let builder = SetWebhookParams::builder()
+                .url(&config.webhook_url)
+                .allowed_updates(telegram_runtime_allowed_updates());
+            let params = if config.webhook_secret_token.is_empty() {
+                builder.build()
+            } else {
+                builder.secret_token(&config.webhook_secret_token).build()
+            };
+            with_telegram_api_retry(&config.bot_token, "setWebhook", |api| {
+                api.set_webhook(&params)
+            })
+            .context("Telegram setWebhook request failed")?;
+        }
+    }
+    Ok(())
+}
+
+fn process_telegram_update(
+    db: &mut Connection,
+    config: &mut AppConfig,
+    config_path: &Path,
+    state: &mut TelegramRuntimeState,
+    update: frankenstein::Update,
+) {
+    use frankenstein::UpdateContent;
+
+    match update.content {
+        UpdateContent::Message(message)
+        | UpdateContent::EditedMessage(message)
+        | UpdateContent::ChannelPost(message)
+        | UpdateContent::EditedChannelPost(message) => {
+            if let Err(err) =
+                handle_telegram_query_message(db, config, config_path, state, &message)
+            {
+                eprintln!("Telegram query handling failed: {err}");
+            }
+        }
+        UpdateContent::CallbackQuery(callback_query) => {
+            if let Err(err) =
+                handle_telegram_callback_query(db, config, config_path, state, &callback_query)
+            {
+                eprintln!("Telegram callback handling failed: {err}");
+            }
+        }
+        _ => {}
+    }
+}
+
 fn poll_telegram_queries(
     db: &mut Connection,
     config: &mut AppConfig,
     config_path: &Path,
-    state: &mut TelegramPollingState,
+    state: &mut TelegramRuntimeState,
 ) -> Result<()> {
     if !config.telegram.enabled {
         return Ok(());
     }
 
-    use frankenstein::{AllowedUpdate, GetUpdatesParams, TelegramApi, UpdateContent};
+    use frankenstein::{GetUpdatesParams, TelegramApi};
 
-    let api = frankenstein::Api::new(&config.telegram.bot_token);
     let params = GetUpdatesParams::builder()
         .limit(100_u32)
-        .allowed_updates(vec![
-            AllowedUpdate::Message,
-            AllowedUpdate::EditedMessage,
-            AllowedUpdate::ChannelPost,
-            AllowedUpdate::EditedChannelPost,
-            AllowedUpdate::CallbackQuery,
-        ]);
+        .allowed_updates(telegram_runtime_allowed_updates());
     let params = match state.next_offset {
         Some(offset) => params.offset(offset).build(),
         None => params.build(),
     };
 
-    let response = api
-        .get_updates(&params)
-        .context("Telegram getUpdates request failed")?;
+    let response = with_telegram_api_retry(&config.telegram.bot_token, "getUpdates", |api| {
+        api.get_updates(&params)
+    })
+    .context("Telegram getUpdates request failed")?;
 
     for update in response.result {
         state.next_offset = Some(update.update_id + 1);
-        match update.content {
-            UpdateContent::Message(message)
-            | UpdateContent::EditedMessage(message)
-            | UpdateContent::ChannelPost(message)
-            | UpdateContent::EditedChannelPost(message) => {
-                if let Err(err) =
-                    handle_telegram_query_message(db, config, config_path, state, &message)
-                {
-                    eprintln!("Telegram query handling failed: {err}");
-                }
-            }
-            UpdateContent::CallbackQuery(callback_query) => {
-                if let Err(err) = handle_telegram_callback_query(
-                    db,
-                    config,
-                    config_path,
-                    state,
-                    &callback_query,
-                )
-                {
-                    eprintln!("Telegram callback handling failed: {err}");
-                }
-            }
-            _ => {}
-        }
+        process_telegram_update(db, config, config_path, state, update);
     }
 
     Ok(())
+}
+
+async fn telegram_webhook_handler(
+    State(state): State<TelegramWebhookAppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> StatusCode {
+    const TELEGRAM_SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
+    const CF_CONNECTING_IP_HEADER: &str = "cf-connecting-ip";
+    const CF_RAY_HEADER: &str = "cf-ray";
+    const USER_AGENT_HEADER: &str = "user-agent";
+
+    let peer_ip = peer_addr.ip();
+    let cf_connecting_ip = header_value(&headers, CF_CONNECTING_IP_HEADER);
+    let cf_ray = header_value(&headers, CF_RAY_HEADER);
+    let user_agent = header_value(&headers, USER_AGENT_HEADER);
+    let source_is_cloudflare = is_cloudflare_ip(peer_ip, &state.cloudflare_ip_ranges);
+    let source_is_trusted_proxy = is_trusted_proxy_ip(peer_ip, &state.trusted_proxy_cidrs);
+    let has_cloudflare_headers = cf_connecting_ip.is_some() && cf_ray.is_some();
+
+    if !source_is_cloudflare && !(source_is_trusted_proxy && has_cloudflare_headers) {
+        log_telegram_webhook_request(
+            &state.audit_log_path,
+            peer_ip,
+            cf_connecting_ip,
+            cf_ray,
+            user_agent,
+            false,
+            &format!(
+                "rejected sender path={} reason=peer not in Cloudflare ranges or trusted proxy allowlist",
+                uri.path()
+            ),
+        );
+        return StatusCode::FORBIDDEN;
+    }
+
+    if source_is_trusted_proxy && !has_cloudflare_headers {
+        log_telegram_webhook_request(
+            &state.audit_log_path,
+            peer_ip,
+            cf_connecting_ip,
+            cf_ray,
+            user_agent,
+            false,
+            &format!(
+                "rejected sender path={} reason=trusted proxy request missing Cloudflare headers",
+                uri.path()
+            ),
+        );
+        return StatusCode::FORBIDDEN;
+    }
+
+    if let Some(expected) = state.secret_token.as_deref() {
+        let provided = header_value(&headers, TELEGRAM_SECRET_HEADER);
+        if provided != Some(expected) {
+            log_telegram_webhook_request(
+                &state.audit_log_path,
+                peer_ip,
+                cf_connecting_ip,
+                cf_ray,
+                user_agent,
+                false,
+                &format!("rejected invalid secret token path={}", uri.path()),
+            );
+            return StatusCode::UNAUTHORIZED;
+        }
+    }
+
+    let update = match serde_json::from_slice::<frankenstein::Update>(&body) {
+        Ok(update) => update,
+        Err(err) => {
+            log_telegram_webhook_request(
+                &state.audit_log_path,
+                peer_ip,
+                cf_connecting_ip,
+                cf_ray,
+                user_agent,
+                false,
+                &format!("rejected invalid json path={} error={err}", uri.path()),
+            );
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    if state.tx.send(update).is_err() {
+        log_telegram_webhook_request(
+            &state.audit_log_path,
+            peer_ip,
+            cf_connecting_ip,
+            cf_ray,
+            user_agent,
+            false,
+            &format!("rejected unavailable processor path={}", uri.path()),
+        );
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    log_telegram_webhook_request(
+        &state.audit_log_path,
+        peer_ip,
+        cf_connecting_ip,
+        cf_ray,
+        user_agent,
+        true,
+        &format!("accepted path={} bytes={}", uri.path(), body.len()),
+    );
+
+    StatusCode::OK
+}
+
+async fn run_telegram_webhook_server(
+    listener: tokio::net::TcpListener,
+    secret_token: Option<String>,
+    tx: mpsc::UnboundedSender<frankenstein::Update>,
+    audit_log_path: PathBuf,
+    cloudflare_ip_ranges: Arc<[IpNet]>,
+    trusted_proxy_cidrs: Arc<[IpNet]>,
+) -> Result<()> {
+    let app_state = TelegramWebhookAppState {
+        secret_token,
+        tx,
+        audit_log_path,
+        cloudflare_ip_ranges,
+        trusted_proxy_cidrs,
+    };
+    let app = Router::new()
+        .route("/", post(telegram_webhook_handler))
+        .route("/{*path}", post(telegram_webhook_handler))
+        .with_state(app_state);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("Telegram webhook server exited unexpectedly")
 }
 
 fn handle_telegram_query_message(
     db: &mut Connection,
     config: &mut AppConfig,
     config_path: &Path,
-    state: &mut TelegramPollingState,
+    state: &mut TelegramRuntimeState,
     message: &frankenstein::Message,
 ) -> Result<()> {
     if message.from.as_ref().is_some_and(|user| user.is_bot) {
@@ -657,6 +1189,8 @@ fn handle_telegram_query_message(
         "/join"
     } else if parse_approve_command(text).is_some() || is_approve_command(text) {
         "/approve"
+    } else if is_help_command(text) {
+        "/help"
     } else if parse_search_command(text).is_some() {
         "/s"
     } else if message.document.is_some() {
@@ -677,8 +1211,11 @@ fn handle_telegram_query_message(
     if !is_telegram_user_allowed(config, from_user.id) {
         log_telegram_message_usage(config, message, false, action, detail);
         if is_join_command(text) {
-            let delivered =
-                send_access_request_to_admins(&config.telegram.bot_token, &config.telegram.admin_user_ids, from_user.id)?;
+            let delivered = send_access_request_to_admins(
+                &config.telegram.bot_token,
+                &config.telegram.admin_user_ids,
+                from_user.id,
+            )?;
             let response = if delivered == 0 {
                 format!(
                     "No admin could be notified. Ask the owner to add your Telegram user ID {} manually.",
@@ -1049,10 +1586,8 @@ fn download_telegram_text_document(
         bail!("only .txt and .md files are supported for /new");
     }
 
-    let api = frankenstein::Api::new(bot_token);
     let params = GetFileParams::builder().file_id(&document.file_id).build();
-    let file = api
-        .get_file(&params)
+    let file = with_telegram_api_retry(bot_token, "getFile", |api| api.get_file(&params))
         .context("Telegram getFile request failed")?;
     let file_path = file
         .result
@@ -1129,7 +1664,7 @@ fn handle_telegram_callback_query(
     db: &Connection,
     config: &mut AppConfig,
     config_path: &Path,
-    state: &mut TelegramPollingState,
+    state: &mut TelegramRuntimeState,
     callback_query: &frankenstein::CallbackQuery,
 ) -> Result<()> {
     let callback_data = callback_query.data.as_deref().unwrap_or("");
@@ -1144,7 +1679,7 @@ fn handle_telegram_callback_query(
     };
     if !is_telegram_user_allowed(config, callback_query.from.id) {
         log_telegram_callback_usage(config, callback_query, false, action, callback_data);
-        answer_callback_query(
+        answer_callback_query_if_possible(
             &config.telegram.bot_token,
             &callback_query.id,
             Some("Unauthorized."),
@@ -1159,7 +1694,7 @@ fn handle_telegram_callback_query(
     };
     if let Some(requested_user_id) = parse_approve_callback(data) {
         if !is_telegram_admin(config, callback_query.from.id) {
-            answer_callback_query(
+            answer_callback_query_if_possible(
                 &config.telegram.bot_token,
                 &callback_query.id,
                 Some("Admin only."),
@@ -1167,7 +1702,7 @@ fn handle_telegram_callback_query(
             return Ok(());
         }
         let added = grant_telegram_user_access(config_path, config, requested_user_id)?;
-        answer_callback_query(
+        answer_callback_query_if_possible(
             &config.telegram.bot_token,
             &callback_query.id,
             Some(if added {
@@ -1196,7 +1731,7 @@ fn handle_telegram_callback_query(
     }
     if let Some((session_id, page)) = parse_page_callback(data) {
         let Some(message) = callback_query.message.as_ref() else {
-            answer_callback_query(
+            answer_callback_query_if_possible(
                 &config.telegram.bot_token,
                 &callback_query.id,
                 Some("This page is no longer available."),
@@ -1204,7 +1739,7 @@ fn handle_telegram_callback_query(
             return Ok(());
         };
         let Some(session) = state.search_sessions.get(&session_id) else {
-            answer_callback_query(
+            answer_callback_query_if_possible(
                 &config.telegram.bot_token,
                 &callback_query.id,
                 Some("Search results expired. Run /s again."),
@@ -1213,6 +1748,7 @@ fn handle_telegram_callback_query(
         };
         let max_page = search_results_page_count(session).saturating_sub(1);
         let page = page.min(max_page);
+        answer_callback_query_if_possible(&config.telegram.bot_token, &callback_query.id, None)?;
         edit_search_results_message(
             &config.telegram.bot_token,
             message.chat.id,
@@ -1221,14 +1757,13 @@ fn handle_telegram_callback_query(
             session,
             page,
         )?;
-        answer_callback_query(&config.telegram.bot_token, &callback_query.id, None)?;
         return Ok(());
     }
     let Some(doc_id) = parse_document_callback(data) else {
         return Ok(());
     };
     let Some(message) = callback_query.message.as_ref() else {
-        answer_callback_query(
+        answer_callback_query_if_possible(
             &config.telegram.bot_token,
             &callback_query.id,
             Some("This selection is no longer available."),
@@ -1237,7 +1772,7 @@ fn handle_telegram_callback_query(
     };
 
     let Some(doc_match) = find_document_by_id(db, doc_id)? else {
-        answer_callback_query(
+        answer_callback_query_if_possible(
             &config.telegram.bot_token,
             &callback_query.id,
             Some("Document not found."),
@@ -1246,7 +1781,7 @@ fn handle_telegram_callback_query(
     };
 
     if !doc_match.path.exists() {
-        answer_callback_query(
+        answer_callback_query_if_possible(
             &config.telegram.bot_token,
             &callback_query.id,
             Some("The file is no longer available."),
@@ -1254,7 +1789,7 @@ fn handle_telegram_callback_query(
         return Ok(());
     }
 
-    answer_callback_query(
+    answer_callback_query_if_possible(
         &config.telegram.bot_token,
         &callback_query.id,
         Some("Sending document..."),
@@ -1276,6 +1811,31 @@ fn handle_telegram_callback_query(
     )?;
 
     Ok(())
+}
+
+fn answer_callback_query_if_possible(
+    bot_token: &str,
+    callback_query_id: &str,
+    text: Option<&str>,
+) -> Result<()> {
+    match answer_callback_query(bot_token, callback_query_id, text) {
+        Ok(()) => Ok(()),
+        Err(err) if is_expired_callback_query_error(&err) => {
+            eprintln!("Telegram callback query expired before it could be answered: {err}");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Telegram callback query could not be answered, continuing anyway: {err}");
+            Ok(())
+        }
+    }
+}
+
+fn is_expired_callback_query_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("query is too old")
+        || message.contains("response timeout expired")
+        || message.contains("query id is invalid")
 }
 
 fn find_query_matches(
@@ -1472,11 +2032,17 @@ fn telegram_help_message(text: &str, is_admin: bool) -> String {
         ""
     };
     if is_help_command(trimmed) {
-        format!("Commands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}")
+        format!(
+            "Commands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}"
+        )
     } else if trimmed.starts_with('/') {
-        format!("Unknown command.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}")
+        format!(
+            "Unknown command.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}"
+        )
     } else {
-        format!("Send a command to continue.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}")
+        format!(
+            "Send a command to continue.\n\nCommands:\n/start show the latest 10 documents\n/show show the latest 10 documents\n/new receive plain text or a .txt/.md file and store it\n/s <keywords> search similar documents\n/clean remove duplicate rows from the database\n/join request access\n/help show this help{admin_line}"
+        )
     }
 }
 
@@ -1982,7 +2548,7 @@ where
 {
     match check() {
         Ok(message) => DoctorCheck::ok(name, message),
-        Err(err) => DoctorCheck::fail(name, err.to_string(), fix),
+        Err(err) => DoctorCheck::fail(name, format!("{err:#}"), fix),
     }
 }
 
@@ -2051,6 +2617,23 @@ fn config_error_fix(config_path: &Path, detail: &str) -> String {
             config_path.display()
         ));
     }
+    if detail.contains("telegram.mode is webhook")
+        || detail.contains("telegram.webhook_bind_addr")
+        || detail.contains("telegram.webhook_secret_token")
+        || detail.contains("telegram.webhook_url must start with https://")
+        || detail.contains("telegram.webhook_trusted_proxy_cidrs")
+    {
+        fixes.push(format!(
+            "If you use webhook mode in {}, set telegram.webhook_url to the public HTTPS endpoint, telegram.webhook_bind_addr to the local listen address, telegram.webhook_secret_token to a random token, and telegram.webhook_trusted_proxy_cidrs only to proxies you control. The webhook listener only accepts direct Cloudflare senders or configured trusted proxies carrying Cloudflare headers.",
+            config_path.display()
+        ));
+    }
+    if detail.contains("Cloudflare IP range") {
+        fixes.push(
+            "Make sure this host can reach https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6 so webhook security checks can load Cloudflare's current IP ranges."
+                .to_string(),
+        );
+    }
     if detail.contains("embedding.preferred_provider")
         || detail.contains("embedding.fallback_provider")
         || detail.contains("embedding.ollama")
@@ -2077,32 +2660,32 @@ fn run_doctor(config_override: Option<PathBuf>) -> Result<()> {
     println!("{}", ui::heading("Running doctor checks..."));
     println!("Config path: {}", ui::path(config_path.display()));
 
+    let created = create_default_config_if_missing(&config_path)?;
+    if created {
+        let check = DoctorCheck::warn(
+            "config",
+            format!("created a new config template at {}", config_path.display()),
+            format!(
+                "Edit {}, fill in watch_dir, embedding providers, and optional Telegram settings, then rerun --doctor.",
+                config_path.display()
+            ),
+        );
+        print_doctor_report(&[check]);
+        bail!("doctor created a new config template")
+    }
+
+    interactive_doctor_prepare_config(&config_path)?;
+
     let loaded_config = match AppConfig::load_or_create(Some(config_path.clone())) {
         Ok(loaded_config) => loaded_config,
         Err(err) => {
-            let detail = err.to_string();
+            let detail = format!("{err:#}");
             let check =
                 DoctorCheck::fail("config", &detail, config_error_fix(&config_path, &detail));
             print_doctor_report(&[check]);
             bail!("doctor found configuration errors")
         }
     };
-
-    if loaded_config.created {
-        let check = DoctorCheck::warn(
-            "config",
-            format!(
-                "created a new config template at {}",
-                loaded_config.path.display()
-            ),
-            format!(
-                "Edit {}, fill in watch_dir, embedding providers, and optional Telegram settings, then rerun --doctor.",
-                loaded_config.path.display()
-            ),
-        );
-        print_doctor_report(&[check]);
-        bail!("doctor created a new config template")
-    }
 
     let config = loaded_config.data;
     let populated_fields = populate_missing_config_fields(&loaded_config.path, &config)?;
@@ -2209,6 +2792,10 @@ fn run_doctor(config_override: Option<PathBuf>) -> Result<()> {
             ),
             || check_telegram(&config.telegram),
         ));
+        checks.push(DoctorCheck::ok(
+            "telegram.mode",
+            format!("using {}", config.telegram.mode.as_str()),
+        ));
         if config.telegram.admin_user_ids.is_empty() && config.telegram.allowed_user_ids.is_empty()
         {
             checks.push(DoctorCheck::warn(
@@ -2232,14 +2819,95 @@ fn run_doctor(config_override: Option<PathBuf>) -> Result<()> {
                 ),
             ));
         }
+        if config.telegram.mode == TelegramMode::Webhook {
+            checks.push(DoctorCheck::ok(
+                "telegram.webhook",
+                format!(
+                    "listening on {} and registering {}",
+                    config.telegram.webhook_bind_addr, config.telegram.webhook_url
+                ),
+            ));
+            checks.push(run_check(
+                "telegram.webhook.bind",
+                format!(
+                    "Free the port in {} if another process is already listening on {}.",
+                    loaded_config.path.display(),
+                    config.telegram.webhook_bind_addr
+                ),
+                || {
+                    let bind_addr = config
+                        .telegram
+                        .webhook_bind_addr
+                        .parse::<SocketAddr>()
+                        .with_context(|| {
+                            format!(
+                                "failed to parse telegram.webhook_bind_addr {}",
+                                config.telegram.webhook_bind_addr
+                            )
+                        })?;
+                    can_bind_telegram_webhook(bind_addr)
+                },
+            ));
+            checks.push(run_check(
+                "telegram.webhook.cloudflare",
+                "Allow outbound HTTPS to Cloudflare so the app can verify Cloudflare edge IP ranges before accepting webhook traffic.",
+                || {
+                    let ranges = fetch_cloudflare_ip_ranges()?;
+                    Ok(format!(
+                        "loaded {} Cloudflare edge IP ranges; webhook will only accept those senders",
+                        ranges.len()
+                    ))
+                },
+            ));
+            checks.push(run_check(
+                "telegram.webhook.trusted_proxy_cidrs",
+                format!(
+                    "Set {} in {} to only loopback or specific reverse proxies you control.",
+                    ui::value("telegram.webhook_trusted_proxy_cidrs"),
+                    loaded_config.path.display()
+                ),
+                || {
+                    let cidrs =
+                        parse_trusted_proxy_cidrs(&config.telegram.webhook_trusted_proxy_cidrs)?;
+                    Ok(format!(
+                        "trusted proxy CIDRs: {}",
+                        cidrs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                },
+            ));
+            checks.push(DoctorCheck::ok(
+                "telegram.webhook_secret_token",
+                "configured".to_string(),
+            ));
+            checks.push(DoctorCheck::ok(
+                "telegram.webhook.audit",
+                format!(
+                    "webhook sender audit lines will be written to {}",
+                    config.telegram.audit_log_path.display()
+                ),
+            ));
+        }
         if config.telegram.chat_id == 0 {
-            checks.push(DoctorCheck::warn(
-                "telegram.notifications",
-                "chat_id is not configured; proactive document notifications are disabled",
+            let fix = if config.telegram.mode == TelegramMode::Polling {
                 format!(
                     "Run {} after messaging the bot if you want the app to push new-document notifications to a default chat.",
                     ui::command("note-embedding --telegram-discover-chat")
-                ),
+                )
+            } else {
+                format!(
+                    "Set {} manually in {} if you want the app to push new-document notifications to a default chat. --telegram-discover-chat only works in polling mode.",
+                    ui::value("telegram.chat_id"),
+                    loaded_config.path.display()
+                )
+            };
+            checks.push(DoctorCheck::warn(
+                "telegram.notifications",
+                "chat_id is not configured; proactive document notifications are disabled",
+                fix,
             ));
         }
     } else {
@@ -2396,8 +3064,8 @@ fn process_pdf_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Res
         return Ok(());
     }
 
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     if metadata.len() == 0 {
         upsert_pdf_tracking_record(db, path, "telegram-pdf-empty")?;
         eprintln!(
@@ -2447,6 +3115,9 @@ async fn main() -> Result<()> {
     if cli.telegram_discover_chat {
         return discover_telegram_chat(cli.config_path());
     }
+    if cli.telegram_delete_webhook {
+        return delete_telegram_webhook_command(cli.config_path());
+    }
     if let Some(action) = cli.service.clone() {
         return handle_service_action(action, cli.config_path());
     }
@@ -2467,11 +3138,13 @@ async fn main() -> Result<()> {
     }
 
     let mut config = loaded_config.data;
+    install_telegram_audit_log_path(&config.telegram.audit_log_path);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (telegram_update_tx, mut telegram_update_rx) = mpsc::unbounded_channel();
     let mut db = init_db(&config.database_path)?;
     init_processed_dir(&config.processed_dir)?;
-    let mut telegram_state = TelegramPollingState::default();
+    let mut telegram_state = TelegramRuntimeState::default();
     let mut telegram_interval =
         time::interval(Duration::from_secs(config.telegram.poll_interval_secs));
     telegram_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2488,14 +3161,83 @@ async fn main() -> Result<()> {
         ui::path(config.processed_dir.display())
     );
     if config.telegram.enabled {
+        if config.telegram.mode == TelegramMode::Webhook {
+            let bind_addr = config
+                .telegram
+                .webhook_bind_addr
+                .parse::<SocketAddr>()
+                .with_context(|| {
+                    format!(
+                        "failed to parse telegram.webhook_bind_addr {}",
+                        config.telegram.webhook_bind_addr
+                    )
+                })?;
+            let cloudflare_ip_ranges: Arc<[IpNet]> =
+                fetch_cloudflare_ip_ranges()?.into_boxed_slice().into();
+            let trusted_proxy_cidrs: Arc<[IpNet]> =
+                parse_trusted_proxy_cidrs(&config.telegram.webhook_trusted_proxy_cidrs)?
+                    .into_boxed_slice()
+                    .into();
+            let listener = tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .with_context(|| {
+                    format!("failed to bind Telegram webhook listener to {bind_addr}")
+                })?;
+            let secret_token = (!config.telegram.webhook_secret_token.is_empty())
+                .then(|| config.telegram.webhook_secret_token.clone());
+            let audit_log_path = config.telegram.audit_log_path.clone();
+            tokio::spawn(async move {
+                if let Err(err) = run_telegram_webhook_server(
+                    listener,
+                    secret_token,
+                    telegram_update_tx,
+                    audit_log_path,
+                    cloudflare_ip_ranges,
+                    trusted_proxy_cidrs,
+                )
+                .await
+                {
+                    eprintln!("Telegram webhook server failed: {err}");
+                }
+            });
+        }
+        configure_telegram_transport(&config.telegram)?;
         if let Err(err) = register_bot_commands(&config.telegram) {
             eprintln!("Failed to register Telegram bot commands: {err}");
         }
-        println!(
-            "Telegram polling: every {} second(s), match accuracy {}",
-            ui::value(config.telegram.poll_interval_secs),
-            ui::value(format!("{:.2}", config.telegram.match_accuracy))
-        );
+        match config.telegram.mode {
+            TelegramMode::Polling => {
+                println!(
+                    "Telegram transport: polling every {} second(s), match accuracy {}",
+                    ui::value(config.telegram.poll_interval_secs),
+                    ui::value(format!("{:.2}", config.telegram.match_accuracy))
+                );
+            }
+            TelegramMode::Webhook => {
+                println!(
+                    "Telegram transport: webhook {} -> {}, match accuracy {}",
+                    ui::value(config.telegram.webhook_bind_addr.as_str()),
+                    ui::value(config.telegram.webhook_url.as_str()),
+                    ui::value(format!("{:.2}", config.telegram.match_accuracy))
+                );
+                println!(
+                    "Telegram webhook sender filter: {}",
+                    ui::detail("Cloudflare edge IPs or trusted proxies with Cloudflare headers")
+                );
+                println!(
+                    "Telegram trusted proxy CIDRs: {}",
+                    ui::detail(config.telegram.webhook_trusted_proxy_cidrs.join(", "))
+                );
+                println!(
+                    "Telegram webhook secret token: {}",
+                    ui::detail(if config.telegram.webhook_secret_token.is_empty() {
+                        "not configured"
+                    } else {
+                        "configured"
+                    })
+                );
+            }
+        }
         println!(
             "Telegram audit log: {}",
             ui::path(config.telegram.audit_log_path.display())
@@ -2517,7 +3259,19 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = telegram_interval.tick(), if config.telegram.enabled => {
+            maybe_update = telegram_update_rx.recv(), if config.telegram.enabled && config.telegram.mode == TelegramMode::Webhook => {
+                let Some(update) = maybe_update else {
+                    break;
+                };
+                process_telegram_update(
+                    &mut db,
+                    &mut config,
+                    &loaded_config.path,
+                    &mut telegram_state,
+                    update,
+                );
+            }
+            _ = telegram_interval.tick(), if config.telegram.enabled && config.telegram.mode == TelegramMode::Polling => {
                 if let Err(err) = poll_telegram_queries(
                     &mut db,
                     &mut config,

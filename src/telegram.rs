@@ -2,10 +2,9 @@ use crate::config::{AppConfig, TelegramConfig};
 use crate::ui;
 use anyhow::{Context, Result};
 use frankenstein::{
-    BotCommand, BotCommandScope, BotCommandScopeChatMember,
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ParseMode,
-    ReplyKeyboardMarkup, ReplyMarkup, SendDocumentParams, SendMessageParams, SetMyCommandsParams,
-    TelegramApi,
+    BotCommand, BotCommandScope, BotCommandScopeChatMember, CallbackQuery, InlineKeyboardButton,
+    InlineKeyboardMarkup, KeyboardButton, Message, ParseMode, ReplyKeyboardMarkup, ReplyMarkup,
+    SendDocumentParams, SendMessageParams, SetMyCommandsParams, TelegramApi,
 };
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, Parser as MarkdownParser, Tag, TagEnd,
@@ -14,22 +13,146 @@ use std::convert::TryFrom;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TELEGRAM_TEXT_MESSAGE_MAX_CHARS: usize = 3800;
 const TELEGRAM_AUDIT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const TELEGRAM_API_MAX_ATTEMPTS: usize = 3;
+const TELEGRAM_API_RETRY_DELAYS_MS: [u64; TELEGRAM_API_MAX_ATTEMPTS - 1] = [250, 1_000];
+static TELEGRAM_AUDIT_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+static TELEGRAM_WEBHOOK_AUDIT_LOG_WRITER: OnceLock<mpsc::Sender<TelegramAuditLogJob>> =
+    OnceLock::new();
+
+struct TelegramAuditLogJob {
+    path: PathBuf,
+    line: String,
+}
+
+pub(crate) fn install_telegram_audit_log_path(path: &Path) {
+    let _ = TELEGRAM_AUDIT_LOG_PATH.set(path.to_path_buf());
+}
+
+pub(crate) fn with_telegram_api_retry<T, F>(
+    bot_token: &str,
+    operation: &str,
+    mut request: F,
+) -> Result<T>
+where
+    F: FnMut(&frankenstein::Api) -> std::result::Result<T, frankenstein::Error>,
+{
+    let mut last_error = None;
+
+    for attempt in 1..=TELEGRAM_API_MAX_ATTEMPTS {
+        let api = frankenstein::Api::new(bot_token);
+        match request(&api) {
+            Ok(response) => return Ok(response),
+            Err(err)
+                if attempt < TELEGRAM_API_MAX_ATTEMPTS && is_retryable_telegram_error(&err) =>
+            {
+                let delay = Duration::from_millis(TELEGRAM_API_RETRY_DELAYS_MS[attempt - 1]);
+                eprintln!(
+                    "Telegram {operation} attempt {attempt} failed with a retryable transport error: {err}. Retrying in {} ms.",
+                    delay.as_millis()
+                );
+                last_error = Some(err);
+                thread::sleep(delay);
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
+        }
+    }
+
+    Err(last_error
+        .expect("telegram retry loop should capture the final retryable error")
+        .into())
+}
+
+pub(crate) fn log_telegram_outbound_result(
+    operation: &str,
+    chat_id: Option<i64>,
+    reply_to_message_id: Option<i32>,
+    detail: &str,
+    error: Option<&str>,
+) {
+    let line = format!(
+        "telegram usage ts={} type=outbound operation={} outcome={} chat_id={} reply_to_message_id={} detail={} error={}",
+        unix_timestamp_secs(),
+        operation,
+        if error.is_some() { "failed" } else { "success" },
+        chat_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        reply_to_message_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        truncate_audit_value(detail, 160),
+        truncate_audit_value(error.unwrap_or("-"), 200),
+    );
+    println!("{} {}", ui::info_label(), line);
+    if let Some(path) = TELEGRAM_AUDIT_LOG_PATH.get() {
+        if let Err(err) = append_telegram_audit_log(path, &line) {
+            eprintln!(
+                "Failed to write Telegram audit log at {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn is_retryable_telegram_error(err: &frankenstein::Error) -> bool {
+    match err {
+        frankenstein::Error::Http(http) => {
+            matches!(http.code, 408 | 500 | 502 | 503 | 504)
+                || looks_like_transient_telegram_transport_message(&http.message)
+        }
+        frankenstein::Error::Decode(message) => {
+            looks_like_transient_telegram_transport_message(message)
+        }
+        _ => false,
+    }
+}
+
+fn looks_like_transient_telegram_transport_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "transport",
+        "connectionfailed",
+        "connection failed",
+        "connect error",
+        "unexpectedeof",
+        "unexpected eof",
+        "status line",
+        "tls close_notify",
+        "network is unreachable",
+        "host is unreachable",
+        "connection reset",
+        "broken pipe",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
 
 pub(crate) fn register_bot_commands(config: &TelegramConfig) -> Result<()> {
     if !config.enabled || config.bot_token.trim().is_empty() {
         return Ok(());
     }
 
-    let api = frankenstein::Api::new(&config.bot_token);
     let default_params = SetMyCommandsParams::builder()
         .commands(default_bot_commands())
         .build();
-    api.set_my_commands(&default_params)?;
+    with_telegram_api_retry(&config.bot_token, "setMyCommands", |api| {
+        api.set_my_commands(&default_params)
+    })?;
 
     for admin_user_id in &config.admin_user_ids {
         let Ok(chat_id) = i64::try_from(*admin_user_id) else {
@@ -45,10 +168,26 @@ pub(crate) fn register_bot_commands(config: &TelegramConfig) -> Result<()> {
             .commands(admin_bot_commands())
             .scope(scope)
             .build();
-        let _ = api.set_my_commands(&admin_params);
+        let _ = with_telegram_api_retry(&config.bot_token, "setMyCommands", |api| {
+            api.set_my_commands(&admin_params)
+        });
     }
 
     Ok(())
+}
+
+pub(crate) fn delete_registered_webhook(config: &TelegramConfig) -> Result<bool> {
+    use frankenstein::DeleteWebhookParams;
+
+    if config.bot_token.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let params = DeleteWebhookParams::builder().build();
+    with_telegram_api_retry(&config.bot_token, "deleteWebhook", |api| {
+        api.delete_webhook(&params)
+    })?;
+    Ok(true)
 }
 
 fn default_bot_commands() -> Vec<BotCommand> {
@@ -164,7 +303,6 @@ fn send_text_to_chat_with_parse_mode_and_markup(
     parse_mode: Option<ParseMode>,
     reply_markup: Option<ReplyMarkup>,
 ) -> Result<()> {
-    let api = frankenstein::Api::new(bot_token);
     let send_message_params = match (reply_to_message_id, parse_mode, reply_markup) {
         (Some(reply_to_message_id), Some(parse_mode), Some(reply_markup)) => {
             SendMessageParams::builder()
@@ -213,7 +351,31 @@ fn send_text_to_chat_with_parse_mode_and_markup(
             .text(message)
             .build(),
     };
-    api.send_message(&send_message_params)?;
+    let result = with_telegram_api_retry(bot_token, "sendMessage", |api| {
+        api.send_message(&send_message_params)
+    });
+    match result {
+        Ok(response) => {
+            log_telegram_outbound_result(
+                "sendMessage",
+                Some(chat_id),
+                reply_to_message_id,
+                message,
+                None,
+            );
+            Ok(response)
+        }
+        Err(err) => {
+            log_telegram_outbound_result(
+                "sendMessage",
+                Some(chat_id),
+                reply_to_message_id,
+                message,
+                Some(&err.to_string()),
+            );
+            Err(err)
+        }
+    }?;
     Ok(())
 }
 
@@ -288,7 +450,6 @@ pub(crate) fn send_text_to_chat_with_document_button(
     document_id: i64,
     reply_to_message_id: Option<i32>,
 ) -> Result<()> {
-    let api = frankenstein::Api::new(bot_token);
     let keyboard = InlineKeyboardMarkup::builder()
         .inline_keyboard(vec![vec![
             InlineKeyboardButton::builder()
@@ -311,7 +472,31 @@ pub(crate) fn send_text_to_chat_with_document_button(
             .reply_markup(ReplyMarkup::InlineKeyboardMarkup(keyboard))
             .build(),
     };
-    api.send_message(&send_message_params)?;
+    let result = with_telegram_api_retry(bot_token, "sendMessage", |api| {
+        api.send_message(&send_message_params)
+    });
+    match result {
+        Ok(response) => {
+            log_telegram_outbound_result(
+                "sendMessage",
+                Some(chat_id),
+                reply_to_message_id,
+                message,
+                None,
+            );
+            Ok(response)
+        }
+        Err(err) => {
+            log_telegram_outbound_result(
+                "sendMessage",
+                Some(chat_id),
+                reply_to_message_id,
+                message,
+                Some(&err.to_string()),
+            );
+            Err(err)
+        }
+    }?;
     Ok(())
 }
 
@@ -663,8 +848,8 @@ fn truncate_audit_value(value: &str, limit: usize) -> String {
     }
 }
 
-fn append_telegram_audit_log(config: &AppConfig, line: &str) -> Result<()> {
-    if let Some(parent) = config.telegram.audit_log_path.parent() {
+fn append_telegram_audit_log(path: &Path, line: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create audit log directory {}", parent.display())
@@ -675,15 +860,10 @@ fn append_telegram_audit_log(config: &AppConfig, line: &str) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&config.telegram.audit_log_path)
-        .with_context(|| {
-            format!(
-                "failed to open Telegram audit log {}",
-                config.telegram.audit_log_path.display()
-            )
-        })?;
+        .open(path)
+        .with_context(|| format!("failed to open Telegram audit log {}", path.display()))?;
     writeln!(file, "{line}")?;
-    trim_telegram_audit_log(&config.telegram.audit_log_path, TELEGRAM_AUDIT_LOG_MAX_BYTES)?;
+    trim_telegram_audit_log(path, TELEGRAM_AUDIT_LOG_MAX_BYTES)?;
     Ok(())
 }
 
@@ -708,14 +888,68 @@ fn trim_telegram_audit_log(path: &Path, max_bytes: u64) -> Result<()> {
     Ok(())
 }
 
+fn webhook_audit_log_writer() -> &'static mpsc::Sender<TelegramAuditLogJob> {
+    TELEGRAM_WEBHOOK_AUDIT_LOG_WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<TelegramAuditLogJob>();
+        thread::spawn(move || {
+            for job in rx {
+                if let Err(err) = append_telegram_audit_log(&job.path, &job.line) {
+                    eprintln!(
+                        "Failed to write Telegram audit log at {}: {err}",
+                        job.path.display()
+                    );
+                }
+            }
+        });
+        tx
+    })
+}
+
+fn enqueue_telegram_webhook_audit_log(path: &Path, line: String) {
+    let job = TelegramAuditLogJob {
+        path: path.to_path_buf(),
+        line,
+    };
+    if let Err(err) = webhook_audit_log_writer().send(job) {
+        let job = err.0;
+        eprintln!(
+            "Failed to queue Telegram webhook audit log at {}",
+            job.path.display()
+        );
+    }
+}
+
 fn log_telegram_usage(config: &AppConfig, line: String) {
     println!("{} {}", ui::info_label(), line);
-    if let Err(err) = append_telegram_audit_log(config, &line) {
+    if let Err(err) = append_telegram_audit_log(&config.telegram.audit_log_path, &line) {
         eprintln!(
             "Failed to write Telegram audit log at {}: {err}",
             config.telegram.audit_log_path.display()
         );
     }
+}
+
+pub(crate) fn log_telegram_webhook_request(
+    audit_log_path: &Path,
+    peer_ip: IpAddr,
+    cf_connecting_ip: Option<&str>,
+    cf_ray: Option<&str>,
+    user_agent: Option<&str>,
+    allowed: bool,
+    detail: &str,
+) {
+    let line = format!(
+        "telegram usage ts={} type=webhook allowed={} peer_ip={} cf_connecting_ip={} cf_ray={} user_agent={} detail={}",
+        unix_timestamp_secs(),
+        allowed,
+        peer_ip,
+        cf_connecting_ip.unwrap_or("-"),
+        cf_ray.unwrap_or("-"),
+        truncate_audit_value(user_agent.unwrap_or("-"), 120),
+        truncate_audit_value(detail, 160),
+    );
+    println!("{} {}", ui::info_label(), line);
+    enqueue_telegram_webhook_audit_log(audit_log_path, line);
 }
 
 pub(crate) fn log_telegram_message_usage(
@@ -730,7 +964,11 @@ pub(crate) fn log_telegram_message_usage(
         .as_ref()
         .and_then(|user| user.username.as_deref())
         .unwrap_or("-");
-    let user_id = message.from.as_ref().map(|user| user.id).unwrap_or_default();
+    let user_id = message
+        .from
+        .as_ref()
+        .map(|user| user.id)
+        .unwrap_or_default();
     let line = format!(
         "telegram usage ts={} type=message allowed={} chat_id={} user_id={} username={} action={} detail={}",
         unix_timestamp_secs(),
@@ -775,7 +1013,6 @@ pub(crate) fn send_access_request_to_admins(
     admin_user_ids: &[u64],
     requester_user_id: u64,
 ) -> Result<usize> {
-    let api = frankenstein::Api::new(bot_token);
     let keyboard = InlineKeyboardMarkup::builder()
         .inline_keyboard(vec![vec![
             InlineKeyboardButton::builder()
@@ -798,8 +1035,20 @@ pub(crate) fn send_access_request_to_admins(
             .text(&text)
             .reply_markup(ReplyMarkup::InlineKeyboardMarkup(keyboard.clone()))
             .build();
-        if api.send_message(&params).is_ok() {
-            delivered += 1;
+        match with_telegram_api_retry(bot_token, "sendMessage", |api| api.send_message(&params)) {
+            Ok(_) => {
+                log_telegram_outbound_result("sendMessage", Some(chat_id), None, &text, None);
+                delivered += 1;
+            }
+            Err(err) => {
+                log_telegram_outbound_result(
+                    "sendMessage",
+                    Some(chat_id),
+                    None,
+                    &text,
+                    Some(&err.to_string()),
+                );
+            }
         }
     }
 
@@ -813,7 +1062,6 @@ pub(crate) fn send_document_to_chat(
     caption: &str,
     reply_to_message_id: Option<i32>,
 ) -> Result<()> {
-    let api = frankenstein::Api::new(bot_token);
     let send_document_params = match reply_to_message_id {
         Some(reply_to_message_id) => SendDocumentParams::builder()
             .chat_id(chat_id)
@@ -827,7 +1075,31 @@ pub(crate) fn send_document_to_chat(
             .caption(caption.to_string())
             .build(),
     };
-    api.send_document(&send_document_params)?;
+    let result = with_telegram_api_retry(bot_token, "sendDocument", |api| {
+        api.send_document(&send_document_params)
+    });
+    match result {
+        Ok(response) => {
+            log_telegram_outbound_result(
+                "sendDocument",
+                Some(chat_id),
+                reply_to_message_id,
+                &document_path.display().to_string(),
+                None,
+            );
+            Ok(response)
+        }
+        Err(err) => {
+            log_telegram_outbound_result(
+                "sendDocument",
+                Some(chat_id),
+                reply_to_message_id,
+                &document_path.display().to_string(),
+                Some(&err.to_string()),
+            );
+            Err(err)
+        }
+    }?;
     Ok(())
 }
 
@@ -838,7 +1110,6 @@ pub(crate) fn answer_callback_query(
 ) -> Result<()> {
     use frankenstein::AnswerCallbackQueryParams;
 
-    let api = frankenstein::Api::new(bot_token);
     let params = match text {
         Some(text) => AnswerCallbackQueryParams::builder()
             .callback_query_id(callback_query_id)
@@ -848,7 +1119,31 @@ pub(crate) fn answer_callback_query(
             .callback_query_id(callback_query_id)
             .build(),
     };
-    api.answer_callback_query(&params)?;
+    let result = with_telegram_api_retry(bot_token, "answerCallbackQuery", |api| {
+        api.answer_callback_query(&params)
+    });
+    match result {
+        Ok(response) => {
+            log_telegram_outbound_result(
+                "answerCallbackQuery",
+                None,
+                None,
+                text.unwrap_or("<empty>"),
+                None,
+            );
+            Ok(response)
+        }
+        Err(err) => {
+            log_telegram_outbound_result(
+                "answerCallbackQuery",
+                None,
+                None,
+                text.unwrap_or("<empty>"),
+                Some(&err.to_string()),
+            );
+            Err(err)
+        }
+    }?;
     Ok(())
 }
 
@@ -862,4 +1157,32 @@ pub(crate) fn notify_user_access_approved(bot_token: &str, user_id: u64) -> Resu
         "Your access request was approved. You can use the bot now.",
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenstein::{Error as TelegramError, HttpError};
+
+    #[test]
+    fn classifies_transport_eof_as_retryable() {
+        let err = TelegramError::Http(HttpError {
+            code: 500,
+            message: "Transport { kind: Io, message: Some(\"Error encountered in the status line\"), source: Some(Custom { kind: UnexpectedEof, error: \"peer closed connection without sending TLS close_notify\" }) }".to_string(),
+        });
+
+        assert!(is_retryable_telegram_error(&err));
+    }
+
+    #[test]
+    fn does_not_retry_regular_api_errors() {
+        let err = TelegramError::Api(frankenstein::ErrorResponse {
+            ok: false,
+            description: "Bad Request: chat not found".to_string(),
+            error_code: 400,
+            parameters: None,
+        });
+
+        assert!(!is_retryable_telegram_error(&err));
+    }
 }
