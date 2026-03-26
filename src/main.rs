@@ -2256,7 +2256,7 @@ fn process_existing_documents(db: &mut Connection, config: &AppConfig) -> Result
 
     for path in paths {
         if let Err(err) = process_new_file(db, config, &path) {
-            eprintln!("处理现有文件失败 ({}): {err}", path.display());
+            eprintln!("{}", err);
         }
     }
 
@@ -2962,9 +2962,91 @@ fn run_doctor(config_override: Option<PathBuf>) -> Result<()> {
     }
 }
 
+/// 处理建议的分类
+#[derive(Debug, Clone)]
+enum ProcessingAdvice {
+    /// 文件相关问题
+    FileIssue {
+        hint: String,
+    },
+    /// Embedding 服务问题
+    EmbeddingService {
+        provider: String,
+        hint: String,
+    },
+    /// 数据库问题
+    Database {
+        hint: String,
+    },
+    /// 存储/移动问题
+    Storage {
+        hint: String,
+    },
+    /// PDF 处理问题
+    PdfProcessing {
+        hint: String,
+    },
+}
+
+impl std::fmt::Display for ProcessingAdvice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessingAdvice::FileIssue { hint } => {
+                write!(f, "[文件问题] {}\n  处理建议: {}", hint, get_file_advice())
+            }
+            ProcessingAdvice::EmbeddingService { provider, hint } => {
+                write!(f, "[Embedding服务问题|{}] {}\n  处理建议: {}", provider, hint, get_embedding_advice(provider))
+            }
+            ProcessingAdvice::Database { hint } => {
+                write!(f, "[数据库问题] {}\n  处理建议: {}", hint, get_database_advice())
+            }
+            ProcessingAdvice::Storage { hint } => {
+                write!(f, "[存储问题] {}\n  处理建议: {}", hint, get_storage_advice())
+            }
+            ProcessingAdvice::PdfProcessing { hint } => {
+                write!(f, "[PDF处理问题] {}\n  处理建议: {}", hint, get_pdf_advice())
+            }
+        }
+    }
+}
+
+fn get_file_advice() -> &'static str {
+    "1. 检查文件是否存在且可读\n   2. 检查进程是否有权限读取该文件\n   3. 检查文件是否被其他程序占用\n   4. 如果是符号链接，确认目标文件可访问"
+}
+
+fn get_embedding_advice(provider: &str) -> &'static str {
+    match provider {
+        "ollama" => "1. 确认 Ollama 服务正在运行: systemctl --user status ollama\n   2. 确认模型已下载: ollama list\n   3. 检查 Ollama 服务地址配置是否正确\n   4. 如果是网络问题，检查防火墙设置\n   5. 可以运行 --doctor 检查 embedding 配置",
+        "gemini" => "1. 确认 Gemini API Key 配置正确且有效\n   2. 检查 API 配额是否耗尽\n   3. 确认模型名称配置正确\n   4. 检查网络是否能访问 Google API\n   5. 可以运行 --doctor 检查 embedding 配置",
+        _ => "1. 检查 embedding provider 配置是否正确\n   2. 运行 --doctor 检查服务可用性",
+    }
+}
+
+fn get_database_advice() -> &'static str {
+    "1. 检查数据库文件所在目录是否有写入权限\n   2. 检查磁盘空间是否充足: df -h\n   3. 检查数据库文件是否损坏，必要时可以删除重建\n   4. 检查数据库文件路径配置是否正确"
+}
+
+fn get_storage_advice() -> &'static str {
+    "1. 检查 processed_dir 目录是否存在且可写\n   2. 检查磁盘空间是否充足: df -h\n   3. 如果是跨文件系统移动失败（EXDEV），会尝试 copy 后删除原文件\n   4. 检查 watch_dir 和 processed_dir 是否在同一个文件系统\n   5. 确认文件没有被其他程序占用"
+}
+
+fn get_pdf_advice() -> &'static str {
+    "1. 确认 Telegram bot_token 和 chat_id 已正确配置\n   2. PDF 文件太大会导致上传失败（Telegram 限制 50MB）\n   3. 检查 Telegram API 配额是否充足\n   4. PDF 转发失败不会影响其他文件处理"
+}
+
+fn format_processing_error(path: &Path, context: &str, advice: &ProcessingAdvice) -> String {
+    format!(
+        "文件处理失败\n  路径: {}\n  原因: {}\n  详情: {}\n",
+        path.display(),
+        context,
+        advice
+    )
+}
+
 fn process_new_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Result<()> {
     if is_pdf_path(path) {
-        return process_pdf_file(db, config, path);
+        return process_pdf_file(db, config, path)
+            .map_err(|e| anyhow::anyhow!("{}", format_processing_error(path, "PDF处理失败", &ProcessingAdvice::PdfProcessing { hint: e.to_string() })));
     }
 
     if !config.supports_path(path) {
@@ -2977,11 +3059,45 @@ fn process_new_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Res
         ui::path(path.display())
     );
 
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    // 1. 读取文件内容
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            let advice = ProcessingAdvice::FileIssue {
+                hint: format!("读取文件失败: {} (错误码: {:?})", e, e.kind()),
+            };
+            return Err(anyhow::anyhow!("{}", format_processing_error(path, "文件读取失败", &advice)));
+        }
+    };
+
+    if content.trim().is_empty() {
+        println!(
+            "{} Skipping empty file: {}",
+            ui::warn_label(),
+            ui::path(path.display())
+        );
+        return Ok(());
+    }
+
     let summary = summarize(&content, 100);
-    let embedding = generate_embedding(config, &content)?;
-    let embedding_vector = serialize_embedding(&embedding.vector)?;
+
+    // 2. 生成 Embedding
+    let embedding = match generate_embedding(config, &content) {
+        Ok(e) => e,
+        Err(e) => {
+            let provider = config.embedding.preferred_provider.as_str();
+            let advice = ProcessingAdvice::EmbeddingService {
+                provider: provider.to_string(),
+                hint: e.to_string(),
+            };
+            return Err(anyhow::anyhow!("{}", format_processing_error(path, "Embedding生成失败", &advice)));
+        }
+    };
+
+    let embedding_vector = serialize_embedding(&embedding.vector).map_err(|e| {
+        anyhow::anyhow!("{}", format_processing_error(path, "Embedding序列化失败", &ProcessingAdvice::Storage { hint: format!("序列化向量失败: {}", e) }))
+    })?;
+
     println!(
         "{} Embedding result: {}",
         ui::ok_label(),
@@ -2993,9 +3109,29 @@ fn process_new_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Res
         ui::value(embedding.vector.len())
     );
 
-    let processed_path = prepare_processed_destination(path, &config.processed_dir)?;
-    let tx = db.transaction()?;
-    tx.execute(
+    // 3. 准备目标路径
+    let processed_path = match prepare_processed_destination(path, &config.processed_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            let advice = ProcessingAdvice::Storage {
+                hint: format!("无法创建目标路径: {}", e),
+            };
+            return Err(anyhow::anyhow!("{}", format_processing_error(path, "目标路径准备失败", &advice)));
+        }
+    };
+
+    // 4. 数据库写入
+    let tx = match db.transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            let advice = ProcessingAdvice::Database {
+                hint: format!("开始数据库事务失败: {}", e),
+            };
+            return Err(anyhow::anyhow!("{}", format_processing_error(path, "数据库事务失败", &advice)));
+        }
+    };
+
+    if let Err(e) = tx.execute(
         "INSERT OR REPLACE INTO docs (path, content_summary, embedding_provider, embedding_dimensions, embedding_vector, embedding_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         (
             processed_path.to_string_lossy().as_ref(),
@@ -3005,9 +3141,27 @@ fn process_new_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Res
             embedding_vector.as_str(),
             embedding.status.as_str(),
         ),
-    )?;
-    move_to_processed_destination(path, &processed_path)?;
-    tx.commit()?;
+    ) {
+        let advice = ProcessingAdvice::Database {
+            hint: format!("写入数据库失败: {} (错误码: {:?})", e, e),
+        };
+        return Err(anyhow::anyhow!("{}", format_processing_error(path, "数据库写入失败", &advice)));
+    }
+
+    // 5. 移动文件到 processed_dir
+    if let Err(e) = move_to_processed_destination(path, &processed_path) {
+        let advice = ProcessingAdvice::Storage {
+            hint: format!("移动文件失败: {}", e),
+        };
+        return Err(anyhow::anyhow!("{}", format_processing_error(path, "文件移动失败", &advice)));
+    }
+
+    if let Err(e) = tx.commit() {
+        let advice = ProcessingAdvice::Database {
+            hint: format!("提交数据库事务失败: {}", e),
+        };
+        return Err(anyhow::anyhow!("{}", format_processing_error(path, "数据库提交失败", &advice)));
+    }
 
     let message = format!(
         "Processed document:\nFile: {}\nMoved to: {}\nEmbedding provider: {}\nEmbedding result: {}\nVector dimensions: {}\nSummary: {}",
@@ -3021,23 +3175,48 @@ fn process_new_file(db: &mut Connection, config: &AppConfig, path: &Path) -> Res
         embedding.vector.len(),
         summary
     );
-    match find_document_by_path(db, &processed_path)? {
-        Some(stored_doc) => {
+
+    // 6. 发送 Telegram 通知（非关键，失败不影响主流程）
+    match find_document_by_path(db, &processed_path) {
+        Ok(Some(stored_doc)) => {
             if let Err(err) = send_to_telegram_with_document_button(
                 &config.telegram,
                 &message,
                 &stored_doc.header,
                 stored_doc.id,
             ) {
-                eprintln!("TG 发送失败: {err}");
+                eprintln!(
+                    "{} Telegram 通知失败: {}\n  处理建议: 1. Telegram 通知失败不影响文件处理，这是非关键错误\n   2. 如果需要通知功能，检查 bot_token 和 chat_id 配置\n   3. 检查网络是否能访问 Telegram API\n   4. 可以运行 --doctor 检查 Telegram 配置",
+                    ui::warn_label(),
+                    err
+                );
             }
         }
-        None => {
+        Ok(None) => {
             if let Err(err) = send_to_telegram(&config.telegram, &message) {
-                eprintln!("TG 发送失败: {err}");
+                eprintln!(
+                    "{} Telegram 通知失败: {}\n  处理建议: 1. Telegram 通知失败不影响文件处理，这是非关键错误\n   2. 如果需要通知功能，检查 bot_token 和 chat_id 配置\n   3. 检查网络是否能访问 Telegram API\n   4. 可以运行 --doctor 检查 Telegram 配置",
+                    ui::warn_label(),
+                    err
+                );
             }
+        }
+        Err(err) => {
+            // find_document_by_path 失败不影响整体流程，只打印警告
+            eprintln!(
+                "{} 查询文档信息失败（不影响处理结果）: {}",
+                ui::warn_label(),
+                err
+            );
         }
     }
+
+    println!(
+        "{} Successfully processed: {} -> {}",
+        ui::ok_label(),
+        ui::path(path.display()),
+        ui::path(processed_path.display())
+    );
 
     Ok(())
 }
@@ -3255,7 +3434,7 @@ async fn main() -> Result<()> {
                 };
                 for path in event.paths {
                     if let Err(err) = process_new_file(&mut db, &config, &path) {
-                        eprintln!("处理文件失败 ({}): {err}", path.display());
+                        eprintln!("{}", err);
                     }
                 }
             }
